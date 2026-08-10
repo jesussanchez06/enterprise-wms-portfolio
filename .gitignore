@@ -5,3 +5,8 @@ __pycache__/
 venv/
 *.log
 templates/
+demo_sessions/
+enterprise_wms.db
+enterprise_wms_master.db
+*.db-wal
+*.db-shm

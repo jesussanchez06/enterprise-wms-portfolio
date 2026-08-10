@@ -1,10 +1,11 @@
-from flask import Flask, request, redirect, render_template_string, send_from_directory, Response
+from flask import Flask, request, redirect, render_template_string, send_from_directory, Response, session, has_request_context
 import sqlite3
 from datetime import datetime
 import pandas as pd
 import os
 import io
 import base64
+import shutil
 from datetime import timedelta
 from uuid import uuid4
 import random
@@ -26,12 +27,104 @@ import matplotlib.pyplot as plt
 # Python 3.12 deprecation warning about the default adapter)
 sqlite3.register_adapter(datetime, lambda dt: dt.isoformat())
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MASTER_DB = os.path.join(BASE_DIR, "enterprise_wms_master.db")
+LEGACY_DB = os.path.join(BASE_DIR, "enterprise_wms.db")
+SESSION_DB_DIR = os.path.join(BASE_DIR, "demo_sessions")
+# Backward-compatible alias used by older call sites / docs.
+DB = MASTER_DB
+
+
+def ensure_session_db_dir():
+    os.makedirs(SESSION_DB_DIR, exist_ok=True)
+
+
+def migrate_legacy_db_to_master():
+    """Promote the original shared DB into the master seed if needed."""
+    if os.path.exists(MASTER_DB):
+        return False
+    if os.path.exists(LEGACY_DB):
+        shutil.copy2(LEGACY_DB, MASTER_DB)
+        return True
+    return False
+
+
+def get_demo_session_id():
+    session_id = session.get("demo_session_id")
+    if not session_id:
+        session_id = uuid4().hex
+        session["demo_session_id"] = session_id
+    session.permanent = True
+    return session_id
+
+
+def session_db_path(session_id=None):
+    ensure_session_db_dir()
+    resolved_id = session_id or get_demo_session_id()
+    return os.path.join(SESSION_DB_DIR, f"{resolved_id}.db")
+
+
+def clone_master_database(dest_path):
+    ensure_session_db_dir()
+    parent = os.path.dirname(dest_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    if not os.path.exists(MASTER_DB):
+        # Master will be created by init_db/startup; create empty file as fallback.
+        open(MASTER_DB, "a").close()
+
+    source = sqlite3.connect(MASTER_DB, timeout=10, check_same_thread=False)
+    try:
+        destination = sqlite3.connect(dest_path, timeout=10, check_same_thread=False)
+        try:
+            source.backup(destination)
+            destination.commit()
+        finally:
+            destination.close()
+    finally:
+        source.close()
+
+
+def ensure_visitor_session_db(force_reset=False):
+    """Clone the shared master seed into an isolated per-visitor SQLite file."""
+    path = session_db_path()
+    if force_reset and os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        for suffix in ("-wal", "-shm"):
+            sidecar = path + suffix
+            if os.path.exists(sidecar):
+                try:
+                    os.remove(sidecar)
+                except OSError:
+                    pass
+
+    if not os.path.exists(path):
+        clone_master_database(path)
+    return path
+
+
+def resolve_db_path(use_master=False):
+    if use_master:
+        return MASTER_DB
+    if has_request_context():
+        return ensure_visitor_session_db()
+    return MASTER_DB
+
 
 # helper to centralize connection settings (timeout + thread sharing)
-def get_conn():
-    conn = sqlite3.connect(DB, timeout=10, check_same_thread=False)
+def get_conn(use_master=False):
+    db_path = resolve_db_path(use_master=use_master)
+    conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
     ensure_runtime_schema(conn)
     return conn
+
+
+def reset_visitor_demo_data():
+    """Restore this browser visitor to the original sample warehouse baseline."""
+    ensure_visitor_session_db(force_reset=True)
+    return {"reset": True, "session_id": session.get("demo_session_id", "")}
 
 
 def get_runtime_config(default_port):
@@ -262,6 +355,29 @@ def get_best_inventory_location(conn, sku, source_wh):
     )
 
 
+def get_available_inventory_qty(conn, sku, source_wh=None):
+    """Total on-hand quantity for a SKU at the source warehouse (planner ATP check)."""
+    c = conn.cursor()
+    warehouse = clean_display_text(source_wh, SOURCE_WAREHOUSE) or SOURCE_WAREHOUSE
+    source_text, source_text_like, source_city_like, source_code_like = build_warehouse_filters(warehouse)
+    c.execute(
+        """
+        SELECT COALESCE(SUM(quantity), 0)
+        FROM inventory
+        WHERE sku = ?
+          AND (
+            warehouse = ?
+            OR warehouse LIKE ?
+            OR warehouse LIKE ?
+            OR warehouse LIKE ?
+          )
+        """,
+        (sku, source_text, source_text_like, source_city_like, source_code_like),
+    )
+    row = c.fetchone()
+    return int(row[0] or 0) if row else 0
+
+
 def build_inventory_action_url(sku, warehouse="", location=""):
     params = {"sku": sku}
     warehouse_text = clean_display_text(warehouse, "")
@@ -439,10 +555,34 @@ def calculate_sla_status(order_time, urgency, now=None):
 
 SOURCE_WAREHOUSE = "San Diego Warehouse 100"
 DESTINATION_WAREHOUSES = [
+    "San Diego Warehouse 100",
     "Los Angeles Warehouse 200",
     "San Francisco Warehouse 300",
     "San Bernardino Warehouse 400",
 ]
+WAREHOUSE_NETWORK = [
+    "San Diego Warehouse 100",
+    "Los Angeles Warehouse 200",
+    "San Francisco Warehouse 300",
+    "San Bernardino Warehouse 400",
+]
+WAREHOUSE_ALIASES = {
+    "san diego": SOURCE_WAREHOUSE,
+    "san diego warehouse": SOURCE_WAREHOUSE,
+    "san diego warehouse 100": SOURCE_WAREHOUSE,
+    "los angeles": "Los Angeles Warehouse 200",
+    "los angeles warehouse": "Los Angeles Warehouse 200",
+    "los angeles warehouse 200": "Los Angeles Warehouse 200",
+    "san francisco": "San Francisco Warehouse 300",
+    "san francisco warehouse": "San Francisco Warehouse 300",
+    "san francisco warehouse 300": "San Francisco Warehouse 300",
+    "san bernardino": "San Bernardino Warehouse 400",
+    "san bernadino": "San Bernardino Warehouse 400",
+    "san bernardino warehouse": "San Bernardino Warehouse 400",
+    "san bernadino warehouse": "San Bernardino Warehouse 400",
+    "san bernardino warehouse 400": "San Bernardino Warehouse 400",
+    "san bernadino warehouse 400": "San Bernardino Warehouse 400",
+}
 
 ISSUE_ROOT_CAUSES = [
     "Picker Error",
@@ -465,7 +605,7 @@ BLOCKED_ORDER_STATUS = "Blocked"
 SHORTAGE_ISSUE_TYPE = "Inventory Shortage"
 
 ISSUE_ATTACHMENT_DIR = os.path.join(BASE_DIR, "issue_attachments")
-DEFAULT_INVENTORY_WAREHOUSE = "San Diego"
+DEFAULT_INVENTORY_WAREHOUSE = SOURCE_WAREHOUSE
 DEFAULT_INVENTORY_LOCATION = "F01"
 PICKER_ROSTER = [
     "Maria Alvarez",
@@ -615,6 +755,15 @@ def has_valid_inventory_assignment(value):
     return text != ""
 
 
+def canonicalize_warehouse_name(value, fallback=SOURCE_WAREHOUSE):
+    text = clean_display_text(value, "")
+    if not text:
+        return fallback
+    if text in WAREHOUSE_NETWORK:
+        return text
+    return WAREHOUSE_ALIASES.get(text.lower(), fallback)
+
+
 def normalize_inventory_assignments(conn):
     c = conn.cursor()
     c.execute(
@@ -632,7 +781,26 @@ def normalize_inventory_assignments(conn):
         """,
         (DEFAULT_INVENTORY_WAREHOUSE, DEFAULT_INVENTORY_LOCATION),
     )
-    return c.rowcount
+    updated_rows = c.rowcount
+
+    # Collapse misspellings / short labels into the canonical 4-warehouse network.
+    c.execute(
+        """
+        SELECT DISTINCT warehouse
+        FROM inventory
+        WHERE TRIM(COALESCE(warehouse, '')) <> ''
+        """
+    )
+    for (warehouse_name,) in c.fetchall():
+        canonical = canonicalize_warehouse_name(warehouse_name, warehouse_name)
+        if canonical != warehouse_name and canonical in WAREHOUSE_NETWORK:
+            c.execute(
+                "UPDATE inventory SET warehouse = ? WHERE warehouse = ?",
+                (canonical, warehouse_name),
+            )
+            updated_rows += c.rowcount
+
+    return updated_rows
 
 
 def ensure_quality_audit_schema(conn):
@@ -2509,9 +2677,18 @@ def ensure_bootstrap_demo_data():
     return result
 
 app = Flask(__name__)
-
-DB = os.path.join(BASE_DIR, "enterprise_wms.db")
+app.secret_key = os.environ.get("WMS_SECRET_KEY", "enterprise-wms-linkedin-demo-secret")
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=14)
 EXCEL_FILE = os.path.join(BASE_DIR, "WHS Management.xlsx")
+
+
+@app.before_request
+def bind_isolated_demo_session():
+    # Static assets are unused in this monolith; still skip non-HTML noise safely.
+    if request.endpoint == "static":
+        return None
+    ensure_visitor_session_db()
+    return None
 
 # ======================================================
 # DATABASE INITIALIZATION
@@ -2765,12 +2942,28 @@ def layout(content, body_class=""):
             position: sticky;
             top: 0;
             z-index: 10;
-            backdrop-filter: blur(14px);
             border-bottom: 1px solid rgba(217, 226, 236, 0.85);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 14px;
+            flex-wrap: wrap;
+        }
+        .nav-brand {
+            color: var(--ink-900);
+            font-weight: 800;
+            letter-spacing: -0.02em;
+            white-space: nowrap;
+        }
+        .nav-links {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 2px;
         }
         .nav a {
             color: var(--ink-700);
-            margin-right: 16px;
+            margin-right: 8px;
             text-decoration: none;
             font-weight: 600;
             padding: 8px 12px;
@@ -2778,6 +2971,78 @@ def layout(content, body_class=""):
             transition: background 0.18s ease, color 0.18s ease;
         }
         .nav a:hover {background: var(--accent-100); color: var(--accent-600);}
+        .nav-reset-form {display: inline; margin: 0;}
+        .nav-reset-btn {
+            background: #fff7ed;
+            color: #9a3412 !important;
+            border: 1px solid #fdba74;
+            box-shadow: none;
+            padding: 8px 12px;
+            border-radius: 999px;
+            font-weight: 700;
+            cursor: pointer;
+            margin-right: 0;
+        }
+        .nav-reset-btn:hover {background: #ffedd5; color: #7c2d12 !important;}
+        .demo-session-note {
+            margin: 0 0 18px 0;
+            padding: 10px 14px;
+            border-radius: 12px;
+            background: #eff6ff;
+            border: 1px solid #bfdbfe;
+            color: #1e3a8a;
+            font-size: 13px;
+            font-weight: 600;
+        }
+        .flash-warning {
+            margin: 0 0 18px 0;
+            padding: 14px 16px;
+            border-radius: 14px;
+            background: #fff7ed;
+            border: 1px solid #fdba74;
+            color: #9a3412;
+        }
+        .flash-warning ul {margin: 8px 0 0 18px; padding: 0;}
+        .ask-suggest {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 12px;
+        }
+        .ask-suggest button {
+            background: #eff6ff;
+            color: #1d4ed8;
+            border: 1px solid #bfdbfe;
+            box-shadow: none;
+            font-size: 13px;
+            padding: 8px 12px;
+        }
+        .ops-summary-strip {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 12px;
+            margin: 16px 0 22px 0;
+        }
+        .ops-summary-tile {
+            background: #ffffff;
+            border: 1px solid #dbe4f0;
+            border-radius: 14px;
+            padding: 14px 16px;
+        }
+        .ops-summary-tile .label {
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            color: #64748b;
+        }
+        .ops-summary-tile .value {
+            margin-top: 6px;
+            font-size: 24px;
+            font-weight: 800;
+            letter-spacing: -0.03em;
+            color: var(--ink-900);
+        }
         .container {
             padding: 32px 40px 48px 40px;
             max-width: 1440px;
@@ -3503,6 +3768,7 @@ def layout(content, body_class=""):
             display: flex;
             flex-direction: column;
             gap: 8px;
+            position: relative;
         }
         .filter-label {
             font-size: 12px;
@@ -3510,6 +3776,23 @@ def layout(content, body_class=""):
             color: var(--ink-500);
             text-transform: uppercase;
             letter-spacing: 0.06em;
+        }
+        .filter-field select,
+        .filter-field input {
+            width: 100%;
+            min-height: 42px;
+            padding: 10px 12px;
+            border: 1px solid #cbd5e1;
+            border-radius: 12px;
+            background: #fff;
+            color: var(--ink-900);
+            font: inherit;
+        }
+        .filter-field select:focus,
+        .filter-field input:focus {
+            outline: none;
+            border-color: #93c5fd;
+            box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.12);
         }
         .filter-foot {
             display: flex;
@@ -4460,18 +4743,23 @@ def layout(content, body_class=""):
     </head>
     <body class="__BODY_CLASS__">
     <div class="nav">
-        <b style="color:var(--ink-900);">Enterprise WMS</b>
-        <div>
+        <span class="nav-brand">Enterprise WMS</span>
+        <div class="nav-links">
             <a href="/executive">Warehouse Executive Dashboard</a>
             <a href="/planner">Planner</a>
             <a href="/inventory">Inventory</a>
             <a href="/operations">Operations</a>
             <a href="/quality">Quality</a>
             <a href="/supervisor">Supervisor</a>
+            <a href="/ask-wms">Ask WMS</a>
+            <form class="nav-reset-form" method="post" action="/reset-demo" onsubmit="return confirm('Reset this demo session to the original sample warehouse data? Your orders, picks, and adjustments in this browser will be cleared.');">
+                <button class="nav-reset-btn" type="submit">Reset Demo</button>
+            </form>
         </div>
     </div>
 
     <div class="container">
+    <p class="demo-session-note">Private demo session &mdash; your warehouse actions stay in this browser only. Use Reset Demo anytime to restore the shared sample baseline.</p>
     """
     html += content
     html += """
@@ -4491,6 +4779,255 @@ def dashboard():
     # Keep backward compatibility for / and /dashboard while using one
     # canonical dashboard implementation under /executive.
     return redirect("/executive")
+
+
+@app.route("/reset-demo", methods=["POST", "GET"])
+def reset_demo():
+    reset_visitor_demo_data()
+    return redirect("/executive?demo_reset=1")
+
+
+def build_ops_snapshot(conn):
+    c = conn.cursor()
+    snapshot = {
+        "orders_total": 0,
+        "orders_placed": 0,
+        "picking": 0,
+        "pending_verification": 0,
+        "completed": 0,
+        "blocked": 0,
+        "quality_issue": 0,
+        "open_quality_issues": 0,
+        "sku_count": 0,
+        "units_on_hand": 0,
+    }
+
+    c.execute("SELECT status, COUNT(*) FROM order_header GROUP BY status")
+    for status, count in c.fetchall():
+        snapshot["orders_total"] += int(count or 0)
+        key_map = {
+            "Orders Placed": "orders_placed",
+            "Picking in Progress": "picking",
+            "Pending Verification": "pending_verification",
+            "Completed": "completed",
+            "Blocked": "blocked",
+            "Quality Issue": "quality_issue",
+        }
+        mapped = key_map.get(clean_display_text(status, ""))
+        if mapped:
+            snapshot[mapped] = int(count or 0)
+
+    c.execute(
+        """
+        SELECT COUNT(*)
+        FROM supervisor_quality_issues
+        WHERE issue_status NOT IN ('Closed', 'Resolved')
+        """
+    )
+    snapshot["open_quality_issues"] = int(c.fetchone()[0] or 0)
+
+    c.execute("SELECT COUNT(DISTINCT sku), COALESCE(SUM(quantity), 0) FROM inventory WHERE quantity > 0")
+    sku_count, units = c.fetchone()
+    snapshot["sku_count"] = int(sku_count or 0)
+    snapshot["units_on_hand"] = int(units or 0)
+    return snapshot
+
+
+def answer_ask_wms(conn, question):
+    q = clean_display_text(question, "").lower()
+    c = conn.cursor()
+    snapshot = build_ops_snapshot(conn)
+
+    if not q:
+        return (
+            "Ask about shortages, inventory, verification queue, picker workload, quality issues, or request an operations summary.",
+            snapshot,
+        )
+
+    sku_match = re.search(r"\b(sku\s*)?([0-9]{4,6})\b", q)
+    sku_value = sku_match.group(2) if sku_match else ""
+
+    if any(token in q for token in ("summarize", "summary", "overview", "how is", "status of the warehouse", "today")):
+        lines = [
+            f"Operations snapshot: {snapshot['orders_total']} total orders "
+            f"({snapshot['orders_placed']} placed, {snapshot['picking']} picking, "
+            f"{snapshot['pending_verification']} pending verification, {snapshot['completed']} completed).",
+            f"Exceptions: {snapshot['blocked']} blocked by shortage, {snapshot['quality_issue']} quality-issue orders, "
+            f"{snapshot['open_quality_issues']} open supervisor quality cases.",
+            f"Inventory: {snapshot['sku_count']} active SKUs / {snapshot['units_on_hand']:,} units on hand.",
+        ]
+        return " ".join(lines), snapshot
+
+    if any(token in q for token in ("blocked", "shortage", "shortages", "out of stock")):
+        c.execute(
+            """
+            SELECT order_number, status, responsibility
+            FROM order_header
+            WHERE status = 'Blocked'
+            ORDER BY date DESC
+            LIMIT 12
+            """
+        )
+        rows = c.fetchall()
+        if not rows:
+            return "No orders are currently blocked by shortage in this demo session.", snapshot
+        listing = ", ".join(f"{row[0]} ({row[2]})" for row in rows)
+        return f"{len(rows)} blocked order(s): {listing}. Inventory can restock and Supervisor can release shortages.", snapshot
+
+    if sku_value and any(token in q for token in ("on-hand", "on hand", "inventory", "stock", "available", "qty", "quantity")):
+        available = get_available_inventory_qty(conn, sku_value, SOURCE_WAREHOUSE)
+        _, location, best_qty = get_best_inventory_location(conn, sku_value, SOURCE_WAREHOUSE)
+        description = sku_semiconductor_description(sku_value)
+        return (
+            f"SKU {sku_value} ({description}) has {available} unit(s) available at {SOURCE_WAREHOUSE}. "
+            f"Best pick location: {location} with {best_qty} on hand.",
+            snapshot,
+        )
+
+    if any(token in q for token in ("pending verification", "verification", "quality queue", "to verify")):
+        c.execute(
+            """
+            SELECT order_number, date
+            FROM order_header
+            WHERE status = 'Pending Verification'
+            ORDER BY date DESC
+            LIMIT 12
+            """
+        )
+        rows = c.fetchall()
+        if not rows:
+            return "No orders are pending quality verification right now.", snapshot
+        listing = ", ".join(row[0] for row in rows)
+        return f"{len(rows)} order(s) pending verification: {listing}.", snapshot
+
+    if any(token in q for token in ("picker", "pickers", "behind", "workload", "productivity")):
+        c.execute(
+            """
+            SELECT COALESCE(user_role, 'Unassigned') AS picker_name,
+                   COUNT(*) AS pick_events
+            FROM inventory_transactions
+            WHERE tx_code = 'PICK'
+            GROUP BY picker_name
+            ORDER BY pick_events ASC
+            LIMIT 8
+            """
+        )
+        rows = c.fetchall()
+        if not rows:
+            c.execute(
+                """
+                SELECT COUNT(*) FROM order_header
+                WHERE status IN ('Orders Placed', 'Picking in Progress')
+                """
+            )
+            open_picks = int(c.fetchone()[0] or 0)
+            return (
+                f"No pick transactions yet in this session. {open_picks} order(s) are waiting in the Operations queue.",
+                snapshot,
+            )
+        listing = ", ".join(f"{clean_display_text(name, 'Unknown')} ({count} picks)" for name, count in rows)
+        return f"Lowest pick activity so far: {listing}. Compare against the Operations workboard for live assignments.", snapshot
+
+    if any(token in q for token in ("quality issue", "quality issues", "failed audit", "defect", "damage")):
+        c.execute(
+            """
+            SELECT issue_id, order_number, issue_type, issue_status
+            FROM supervisor_quality_issues
+            WHERE issue_status NOT IN ('Closed', 'Resolved')
+            ORDER BY issue_date DESC
+            LIMIT 10
+            """
+        )
+        rows = c.fetchall()
+        if not rows:
+            return "No open quality issues in Supervisor right now.", snapshot
+        listing = ", ".join(f"{row[0]} on {row[1]} ({row[2]} / {row[3]})" for row in rows)
+        return f"{len(rows)} open quality issue(s): {listing}.", snapshot
+
+    if sku_value:
+        available = get_available_inventory_qty(conn, sku_value, SOURCE_WAREHOUSE)
+        return (
+            f"SKU {sku_value} ({sku_semiconductor_description(sku_value)}) currently shows {available} available unit(s) at {SOURCE_WAREHOUSE}.",
+            snapshot,
+        )
+
+    return (
+        "I can answer shortage, inventory, verification, picker, quality, and summary questions using this session's live warehouse data. "
+        "Try one of the suggested prompts below.",
+        snapshot,
+    )
+
+
+@app.route("/ask-wms", methods=["GET", "POST"])
+def ask_wms():
+    question = ""
+    answer = ""
+    snapshot = None
+
+    if request.method == "POST":
+        question = clean_display_text(request.form.get("question"), "")
+    elif request.args.get("q"):
+        question = clean_display_text(request.args.get("q"), "")
+
+    conn = get_conn()
+    if question:
+        answer, snapshot = answer_ask_wms(conn, question)
+    else:
+        snapshot = build_ops_snapshot(conn)
+        answer = (
+            "Ask WMS is a free, local Q&A layer over your private demo warehouse. "
+            "No login and no paid AI APIs — answers come straight from this session's SQLite data."
+        )
+    conn.close()
+
+    suggestions = [
+        "Summarize today's operations",
+        "Which orders are blocked by shortage?",
+        "How many orders pending verification?",
+        "Any open quality issues?",
+        "Which pickers are behind?",
+        "What is on-hand for SKU 11000?",
+    ]
+    suggestion_html = "".join(
+        f"<form method='post' style='display:inline;margin:0;'>"
+        f"<input type='hidden' name='question' value=\"{item}\">"
+        f"<button type='submit'>{item}</button></form>"
+        for item in suggestions
+    )
+
+    content = f"""
+    <section class='card'>
+        <div class='page-eyebrow'>&#9672; Ask WMS</div>
+        <h1>Operational Q&amp;A</h1>
+        <p class='section-note'>
+            Recruiter-friendly, rule-based answers for production, inventory, and quality questions in this isolated demo session.
+        </p>
+
+        <div class='ops-summary-strip'>
+            <div class='ops-summary-tile'><div class='label'>Open Orders</div><div class='value'>{snapshot['orders_total'] - snapshot['completed']}</div></div>
+            <div class='ops-summary-tile'><div class='label'>Blocked</div><div class='value'>{snapshot['blocked']}</div></div>
+            <div class='ops-summary-tile'><div class='label'>Pending QA</div><div class='value'>{snapshot['pending_verification']}</div></div>
+            <div class='ops-summary-tile'><div class='label'>Quality Cases</div><div class='value'>{snapshot['open_quality_issues']}</div></div>
+            <div class='ops-summary-tile'><div class='label'>Active SKUs</div><div class='value'>{snapshot['sku_count']}</div></div>
+        </div>
+
+        <form method='post' style='display:grid;gap:12px;max-width:820px;'>
+            <label for='ask-question' style='font-weight:700;color:#344054;'>Your question</label>
+            <textarea id='ask-question' name='question' rows='3' placeholder='Example: Which orders are blocked by shortage?'>{question}</textarea>
+            <div><button type='submit'>Ask WMS</button></div>
+        </form>
+
+        <div class='ask-suggest'>{suggestion_html}</div>
+    </section>
+
+    <section class='card'>
+        <h2>Answer</h2>
+        <p style='font-size:16px;color:#0f172a;margin:0;'>{answer}</p>
+    </section>
+    """
+    return layout(content)
+
+
 # ======================================================
 # PLANNER
 # Inventory Risks moved to dedicated section above.
@@ -4511,10 +5048,30 @@ def planner():
     )
     sku_rows = c.fetchall()
     skus = [row[0] for row in sku_rows]
+
+    source_text, source_text_like, source_city_like, source_code_like = build_warehouse_filters(SOURCE_WAREHOUSE)
+    c.execute(
+        """
+        SELECT sku, COALESCE(SUM(quantity), 0)
+        FROM inventory
+        WHERE TRIM(COALESCE(sku, '')) <> ''
+          AND (
+            warehouse = ?
+            OR warehouse LIKE ?
+            OR warehouse LIKE ?
+            OR warehouse LIKE ?
+          )
+        GROUP BY sku
+        """,
+        (source_text, source_text_like, source_city_like, source_code_like),
+    )
+    available_by_sku = {row[0]: int(row[1] or 0) for row in c.fetchall()}
+
     sku_catalog = {
         row[0]: {
             "description": sku_semiconductor_description(row[0]),
             "price": float(row[1] or 0),
+            "available": available_by_sku.get(row[0], 0),
         }
         for row in sku_rows
     }
@@ -4594,6 +5151,37 @@ def planner():
         order_number = "ORD-" + current_time.strftime("%Y%m%d%H%M%S")
         request_id = "REQ-" + current_time.strftime("%H%M%S")
         expected_quantity = sum(line_items.values())
+
+        inventory_shortfalls = []
+        for sku_value, qty_value in line_items.items():
+            available_qty = get_available_inventory_qty(conn, sku_value, source)
+            if qty_value > available_qty:
+                inventory_shortfalls.append(
+                    {
+                        "sku": sku_value,
+                        "requested": qty_value,
+                        "available": available_qty,
+                        "description": sku_semiconductor_description(sku_value),
+                    }
+                )
+
+        if inventory_shortfalls:
+            conn.close()
+            shortfall_rows = "".join(
+                f"<li><strong>{item['sku']}</strong> — {item['description']}: "
+                f"requested {item['requested']}, available {item['available']}</li>"
+                for item in inventory_shortfalls
+            )
+            return layout(f"""
+                <div class="card">
+                    <div class="flash-warning">
+                        <h2 style="margin-top:0;">Insufficient Inventory</h2>
+                        <p>Planner cannot place this order because one or more SKUs exceed available on-hand quantity at {source}.</p>
+                        <ul>{shortfall_rows}</ul>
+                    </div>
+                    <a href="/planner">Go Back to Planner</a>
+                </div>
+            """)
 
         c.execute("""
             INSERT INTO order_header (
@@ -4787,7 +5375,7 @@ def planner():
                 <div class='planner-header-copy'>
                     <div class='page-eyebrow'>&#9672; Planner Dashboard</div>
                     <h2>Create Order</h2>
-                    <p class='section-note'>Compact order entry with pricing visibility for planning only. The live queue remains fixed in view below.</p>
+                    <p class='section-note'>Compact order entry with pricing visibility for planning only. Orders cannot exceed available source-warehouse inventory. The live queue remains fixed in view below.</p>
                 </div>
                 <div class='planner-header-metrics'>
                     <div class='planner-metric'>
@@ -4972,11 +5560,22 @@ def planner():
             }}
 
             const sku = skuSelect.value || '';
-            const catalogItem = skuCatalog[sku] || {{ description: 'Select a semiconductor part', price: 0 }};
+            const catalogItem = skuCatalog[sku] || {{ description: 'Select a semiconductor part', price: 0, available: 0 }};
             const quantity = Number(qtyInput.value || 0);
             const lineTotal = Number(catalogItem.price || 0) * quantity;
+            const availableQty = Number(catalogItem.available || 0);
 
-            descCell.textContent = catalogItem.description || 'Select a semiconductor part';
+            if (sku) {{
+                descCell.textContent = (catalogItem.description || 'Semiconductor part') + ' · Available ' + availableQty;
+                if (quantity > availableQty) {{
+                    descCell.style.color = '#b42318';
+                }} else {{
+                    descCell.style.color = '#475569';
+                }}
+            }} else {{
+                descCell.textContent = 'Select a semiconductor part';
+                descCell.style.color = '#475569';
+            }}
             priceCell.textContent = formatCurrency(Number(catalogItem.price || 0));
             totalCell.textContent = formatCurrency(lineTotal);
             updatePlannerTotal();
@@ -5828,7 +6427,10 @@ def operations_update_order_status(order):
 @app.route("/inventory")
 def inventory_overview():
     sku_filter = request.args.get("sku", "").strip()
-    warehouse_filter = request.args.get("warehouse", "").strip()
+    warehouse_filter_raw = request.args.get("warehouse", "").strip()
+    warehouse_filter = canonicalize_warehouse_name(warehouse_filter_raw, "") if warehouse_filter_raw else ""
+    if warehouse_filter and warehouse_filter not in WAREHOUSE_NETWORK:
+        warehouse_filter = ""
     location_filter = request.args.get("location", "").strip()
     tx_code_filter = request.args.get("tx_code", "").strip()
     tx_order_filter = request.args.get("tx_order", "").strip()
@@ -6013,16 +6615,22 @@ def inventory_overview():
     )
     low_stock_rows = c.fetchall()
 
-    c.execute(
-        """
-        SELECT DISTINCT warehouse
-        FROM inventory
-        WHERE TRIM(COALESCE(warehouse, '')) <> ''
-          AND LOWER(TRIM(COALESCE(warehouse, ''))) <> 'nan'
-        ORDER BY warehouse
-        """
+    warehouse_options = list(WAREHOUSE_NETWORK)
+    selected_warehouse = warehouse_filter if warehouse_filter in warehouse_options else ""
+    warehouse_filter_options = ['<option value="">Any warehouse</option>'] + [
+        f"<option value='{warehouse}'{' selected' if warehouse == selected_warehouse else ''}>{warehouse}</option>"
+        for warehouse in warehouse_options
+    ]
+    adjust_warehouse_value = canonicalize_warehouse_name(
+        adjust_warehouse or warehouse_filter or SOURCE_WAREHOUSE,
+        SOURCE_WAREHOUSE,
     )
-    warehouse_options = [row[0] for row in c.fetchall()]
+    if adjust_warehouse_value not in warehouse_options:
+        adjust_warehouse_value = SOURCE_WAREHOUSE
+    adjust_warehouse_options = "".join(
+        f"<option value='{warehouse}'{' selected' if warehouse == adjust_warehouse_value else ''}>{warehouse}</option>"
+        for warehouse in warehouse_options
+    )
     c.execute(
         """
         SELECT DISTINCT location
@@ -6479,8 +7087,10 @@ def inventory_overview():
                     <input name='sku' value='{sku_filter}' placeholder='Find by SKU code' style='padding:8px 12px;border:1px solid #e2e8f0;border-radius:6px;'>
                 </div>
                 <div class='filter-field'>
-                    <label class='filter-label'><b>Warehouse</b></label>
-                    <input name='warehouse' value='{warehouse_filter}' list='warehouse-options' placeholder='Any warehouse' style='padding:8px 12px;border:1px solid #e2e8f0;border-radius:6px;'>
+                    <label class='filter-label' for='inventory-warehouse'><b>Warehouse</b></label>
+                    <select id='inventory-warehouse' name='warehouse'>
+                        {''.join(warehouse_filter_options)}
+                    </select>
                 </div>
                 <div class='filter-field'>
                     <label class='filter-label'><b>Location</b></label>
@@ -6533,9 +7143,6 @@ def inventory_overview():
                 </div>
             </div>
         </form>
-        <datalist id='warehouse-options'>
-            {''.join(f"<option value='{warehouse}'></option>" for warehouse in warehouse_options)}
-        </datalist>
         <datalist id='location-options'>
             {''.join(f"<option value='{location}'></option>" for location in location_options)}
         </datalist>
@@ -6592,8 +7199,10 @@ def inventory_overview():
                         <input name='sku' value='{adjust_sku or sku_filter}' list='sku-options' placeholder='Select SKU' required>
                     </div>
                     <div class='filter-field'>
-                        <label class='filter-label'>Warehouse</label>
-                        <input name='warehouse' value='{adjust_warehouse or warehouse_filter}' list='warehouse-options' placeholder='Warehouse' required>
+                        <label class='filter-label' for='adjust-warehouse'>Warehouse</label>
+                        <select id='adjust-warehouse' name='warehouse' required>
+                            {adjust_warehouse_options}
+                        </select>
                     </div>
                     <div class='filter-field'>
                         <label class='filter-label'>Location</label>
@@ -6686,7 +7295,7 @@ def inventory_overview():
 @app.route("/inventory_adjust", methods=["POST"])
 def inventory_adjust():
     sku = request.form.get("sku", "").strip()
-    warehouse = request.form.get("warehouse", "").strip()
+    warehouse = canonicalize_warehouse_name(request.form.get("warehouse", "").strip(), "")
     location = request.form.get("location", "").strip()
     qty_change_raw = request.form.get("qty_change", "").strip()
     notes = request.form.get("notes", "").strip()
@@ -6698,9 +7307,9 @@ def inventory_adjust():
         "low_stock_threshold": parse_low_stock_threshold(request.form.get("low_stock_threshold")),
     }
 
-    if not sku or not warehouse or not location:
+    if not sku or not warehouse or warehouse not in WAREHOUSE_NETWORK or not location:
         redirect_params.update({
-            "inventory_message": "SKU, warehouse, and location are required before an adjustment can be posted.",
+            "inventory_message": "SKU, a valid network warehouse, and location are required before an adjustment can be posted.",
             "inventory_message_type": "error",
         })
         return redirect(f"/inventory?{urlencode(redirect_params)}#adjust-inventory")
@@ -8933,6 +9542,8 @@ def executive_dashboard():
         ("Completed",           "Shipped",       status_map.get("Completed", 0),            "#dcfce7", "#166534"),
     ]
     quality_exc_count = status_map.get("Quality Issue", 0)
+    blocked_count = status_map.get("Blocked", 0)
+    pending_verification_count = status_map.get("Pending Verification", 0)
 
     # ── Daily order volume — last 14 days ─────────────────────────────────────
     c.execute("""
@@ -9560,6 +10171,14 @@ def executive_dashboard():
         <p style='color:var(--ink-500);font-size:15px;margin:0;'>
             Live operational overview &mdash; {format_executive_timestamp(now)}
         </p>
+        {f"<div class='demo-session-note' style='margin-top:14px;background:#ecfdf5;border-color:#86efac;color:#166534;'>Demo session restored to the original sample warehouse baseline.</div>" if request.args.get('demo_reset') == '1' else ''}
+        <div class='ops-summary-strip'>
+            <div class='ops-summary-tile'><div class='label'>Pending Work</div><div class='value'>{orders_pending:,}</div></div>
+            <div class='ops-summary-tile'><div class='label'>Blocked Shortages</div><div class='value'>{blocked_count:,}</div></div>
+            <div class='ops-summary-tile'><div class='label'>Pending Verification</div><div class='value'>{pending_verification_count:,}</div></div>
+            <div class='ops-summary-tile'><div class='label'>Open Quality Cases</div><div class='value'>{open_quality_issue_count:,}</div></div>
+            <div class='ops-summary-tile'><div class='label'>SLA Breached</div><div class='value'>{sla_breached:,}</div></div>
+        </div>
         <div class='exec-section-switcher'>
             <button type='button' class='exec-switch-btn active' data-target='overview'>Overview</button>
             <button type='button' class='exec-switch-btn' data-target='productivity'>Productivity</button>
@@ -10069,6 +10688,11 @@ def executive_dashboard():
 # STARTUP
 # ======================================================
 if __name__ == "__main__":
+    ensure_session_db_dir()
+    migrated = migrate_legacy_db_to_master()
+    if migrated:
+        print("Promoted existing enterprise_wms.db into enterprise_wms_master.db seed template.")
+
     init_db()
     try:
         load_inventory()
@@ -10085,12 +10709,13 @@ if __name__ == "__main__":
             f"{bootstrap_result['seeded_quality_escalations']} quality escalation(s)."
         )
 
-    conn = get_conn()
+    # Keep the master template clean so every new visitor clones the same baseline.
+    conn = get_conn(use_master=True)
     reset_summary = reset_demo_data(conn)
     conn.commit()
     if reset_summary["orders_removed"]:
         print(
-            "Startup reset cleared active warehouse workload: "
+            "Master seed reset cleared active warehouse workload: "
             f"{reset_summary['status_summary']}"
         )
     normalized_rows = normalize_inventory_assignments(conn)
@@ -10119,4 +10744,5 @@ if __name__ == "__main__":
     if selected_port != port:
         print(f"Port {port} is busy. Starting Enterprise WMS on port {selected_port} instead.")
 
+    print("Visitor demos use isolated SQLite files under demo_sessions/ cloned from the master seed.")
     app.run(host=host, port=selected_port, debug=debug, use_reloader=False)
