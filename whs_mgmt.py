@@ -17,6 +17,7 @@ import time
 import signal
 import re
 from urllib.parse import urlencode
+from html import escape as html_escape
 from werkzeug.utils import secure_filename
 from zoneinfo import ZoneInfo
 
@@ -942,6 +943,64 @@ def ensure_order_header_pick_tracking_schema(conn):
     )
 
 
+def ensure_ask_wms_chat_schema(conn):
+    c = conn.cursor()
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ask_wms_conversations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ask_wms_chat (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id INTEGER,
+            created_at TEXT,
+            role TEXT,
+            message TEXT,
+            meta_json TEXT
+        )
+        """
+    )
+    c.execute("PRAGMA table_info(ask_wms_chat)")
+    columns = {row[1] for row in c.fetchall()}
+    if "conversation_id" not in columns:
+        c.execute("ALTER TABLE ask_wms_chat ADD COLUMN conversation_id INTEGER")
+
+    # Migrate legacy single-thread messages into one conversation if needed.
+    c.execute(
+        """
+        SELECT COUNT(*)
+        FROM ask_wms_chat
+        WHERE conversation_id IS NULL
+        """
+    )
+    legacy_count = int(c.fetchone()[0] or 0)
+    if legacy_count:
+        stamp = now_pt().isoformat()
+        c.execute(
+            """
+            INSERT INTO ask_wms_conversations (title, created_at, updated_at)
+            VALUES (?, ?, ?)
+            """,
+            ("Earlier conversation", stamp, stamp),
+        )
+        legacy_id = c.lastrowid
+        c.execute(
+            """
+            UPDATE ask_wms_chat
+            SET conversation_id = ?
+            WHERE conversation_id IS NULL
+            """,
+            (legacy_id,),
+        )
+
+
 def ensure_runtime_schema(conn):
     c = conn.cursor()
     c.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -953,6 +1012,7 @@ def ensure_runtime_schema(conn):
     if "quality_audits" in tables:
         ensure_quality_audit_schema(conn)
 
+    ensure_ask_wms_chat_schema(conn)
     conn.commit()
 
 
@@ -2786,6 +2846,7 @@ def init_db():
             last_updated_at TEXT
         )
     """)
+    ensure_ask_wms_chat_schema(conn)
 
     c.execute("""
         CREATE TRIGGER IF NOT EXISTS inventory_positive_insert_requires_assignment
@@ -3007,15 +3068,199 @@ def layout(content, body_class=""):
             display: flex;
             flex-wrap: wrap;
             gap: 8px;
-            margin-top: 12px;
+            margin-top: 10px;
         }
         .ask-suggest button {
             background: #eff6ff;
             color: #1d4ed8;
             border: 1px solid #bfdbfe;
             box-shadow: none;
+            font-size: 12px;
+            padding: 7px 10px;
+        }
+        .ask-chip {
+            background: #f8fafc !important;
+            color: #334155 !important;
+            border: 1px solid #dbe4f0 !important;
+            border-radius: 999px !important;
+            box-shadow: none !important;
+            font-size: 12px !important;
+            padding: 6px 12px !important;
+            width: auto !important;
+        }
+        .ask-chip:hover {
+            background: #eff6ff !important;
+            color: #1d4ed8 !important;
+            border-color: #bfdbfe !important;
+        }
+        .ask-layout {
+            display: grid;
+            grid-template-columns: 260px minmax(0, 1fr);
+            gap: 16px;
+            align-items: stretch;
+            min-height: calc(100vh - 180px);
+        }
+        .ask-sidebar {
+            background: #fff;
+            border: 1px solid rgba(217, 226, 236, 0.9);
+            border-radius: 20px;
+            box-shadow: var(--shadow-soft);
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            max-height: calc(100vh - 180px);
+        }
+        .ask-sidebar-title {
+            margin: 0;
+            font-size: 15px;
+            font-weight: 800;
+            color: var(--ink-900);
+        }
+        .ask-new-chat {
+            width: 100%;
+            box-shadow: none;
+        }
+        .ask-conversation-list {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            overflow-y: auto;
+            flex: 1;
+            padding-right: 2px;
+        }
+        .ask-conversation-item {
+            display: block;
+            text-decoration: none;
+            color: var(--ink-900);
+            border: 1px solid #e2e8f0;
+            background: #f8fafc;
+            border-radius: 12px;
+            padding: 10px 12px;
             font-size: 13px;
-            padding: 8px 12px;
+            font-weight: 600;
+            line-height: 1.35;
+        }
+        .ask-conversation-item:hover {
+            background: #eff6ff;
+            border-color: #bfdbfe;
+            color: #1d4ed8;
+        }
+        .ask-conversation-item.active {
+            background: #eff6ff;
+            border-color: #93c5fd;
+            color: #1d4ed8;
+        }
+        .ask-conversation-meta {
+            display: block;
+            margin-top: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            color: #94a3b8;
+        }
+        .ask-chat-shell {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            background: #fff;
+            border: 1px solid rgba(217, 226, 236, 0.9);
+            border-radius: 20px;
+            box-shadow: var(--shadow-soft);
+            padding: 18px;
+            min-height: calc(100vh - 180px);
+        }
+        .ask-chat-log {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            flex: 1;
+            max-height: none;
+            min-height: 360px;
+            overflow-y: auto;
+            padding: 4px 2px 8px 2px;
+        }
+        .ask-bubble {
+            border-radius: 16px;
+            padding: 12px 14px;
+            border: 1px solid #dbe4f0;
+            background: #fff;
+            max-width: 88%;
+        }
+        .ask-bubble.user {
+            align-self: flex-end;
+            background: #eff6ff;
+            border-color: #bfdbfe;
+        }
+        .ask-bubble.assistant {
+            align-self: flex-start;
+            background: #f8fafc;
+        }
+        .ask-bubble-role {
+            font-size: 11px;
+            font-weight: 800;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            color: #64748b;
+            margin-bottom: 6px;
+        }
+        .ask-bubble-time {
+            margin-top: 8px;
+            font-size: 11px;
+            color: #94a3b8;
+        }
+        .ask-headline {
+            margin: 0;
+            font-size: 15px;
+            font-weight: 700;
+            color: #0f172a;
+            line-height: 1.5;
+        }
+        .ask-bullets {
+            margin: 10px 0 0 0;
+            padding-left: 18px;
+            color: #334155;
+        }
+        .ask-bullets li {margin: 4px 0;}
+        .ask-followup {
+            margin: 10px 0 0 0;
+            font-size: 13px;
+            color: #475569;
+        }
+        .ask-composer {
+            display: grid;
+            gap: 10px;
+            border-top: 1px solid #eef2f7;
+            padding-top: 12px;
+        }
+        .ask-composer textarea {
+            min-height: 72px;
+            resize: vertical;
+        }
+        .ask-composer-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .ask-page-header {
+            margin-bottom: 14px;
+        }
+        .ask-page-header h1 {
+            margin: 0 0 4px 0;
+            font-size: 28px;
+        }
+        .ask-empty {
+            margin: auto;
+            text-align: center;
+            color: #64748b;
+            max-width: 420px;
+            padding: 40px 12px;
+        }
+        @media (max-width: 980px) {
+            .ask-layout {grid-template-columns: 1fr;}
+            .ask-sidebar {max-height: 240px;}
+            .ask-chat-shell, .ask-sidebar {min-height: 0;}
         }
         .ops-summary-strip {
             display: grid;
@@ -4798,8 +5043,16 @@ def build_ops_snapshot(conn):
         "blocked": 0,
         "quality_issue": 0,
         "open_quality_issues": 0,
+        "open_shortage_issues": 0,
         "sku_count": 0,
         "units_on_hand": 0,
+        "inventory_value": 0.0,
+        "sla_healthy": 0,
+        "sla_at_risk": 0,
+        "sla_breached": 0,
+        "audits_total": 0,
+        "audits_passed": 0,
+        "audits_failed": 0,
     }
 
     c.execute("SELECT status, COUNT(*) FROM order_header GROUP BY status")
@@ -4822,46 +5075,708 @@ def build_ops_snapshot(conn):
         SELECT COUNT(*)
         FROM supervisor_quality_issues
         WHERE issue_status NOT IN ('Closed', 'Resolved')
-        """
+          AND COALESCE(issue_type, '') != ?
+        """,
+        (SHORTAGE_ISSUE_TYPE,),
     )
     snapshot["open_quality_issues"] = int(c.fetchone()[0] or 0)
+
+    c.execute(
+        """
+        SELECT COUNT(*)
+        FROM supervisor_quality_issues
+        WHERE issue_status NOT IN ('Closed', 'Resolved')
+          AND COALESCE(issue_type, '') = ?
+        """,
+        (SHORTAGE_ISSUE_TYPE,),
+    )
+    snapshot["open_shortage_issues"] = int(c.fetchone()[0] or 0)
 
     c.execute("SELECT COUNT(DISTINCT sku), COALESCE(SUM(quantity), 0) FROM inventory WHERE quantity > 0")
     sku_count, units = c.fetchone()
     snapshot["sku_count"] = int(sku_count or 0)
     snapshot["units_on_hand"] = int(units or 0)
+
+    c.execute("SELECT COALESCE(SUM(CAST(quantity AS REAL) * price), 0) FROM inventory WHERE quantity > 0")
+    snapshot["inventory_value"] = float(c.fetchone()[0] or 0)
+
+    c.execute("SELECT COUNT(*) FROM quality_audits")
+    snapshot["audits_total"] = int(c.fetchone()[0] or 0)
+    c.execute("SELECT COUNT(*) FROM quality_audits WHERE result IN ('Pass', 'Passed')")
+    snapshot["audits_passed"] = int(c.fetchone()[0] or 0)
+    c.execute("SELECT COUNT(*) FROM quality_audits WHERE result='Failed'")
+    snapshot["audits_failed"] = int(c.fetchone()[0] or 0)
+
+    now = now_pt()
+    c.execute("SELECT urgency, status, date FROM order_header WHERE status != 'Completed'")
+    for urgency, status, date_str in c.fetchall():
+        try:
+            order_time = parse_order_datetime(date_str)
+            sla_key, _ = calculate_sla_status(order_time, normalize_urgency(urgency, "Standard"), now)
+        except Exception:
+            continue
+        if sla_key == "healthy":
+            snapshot["sla_healthy"] += 1
+        elif sla_key == "at_risk":
+            snapshot["sla_at_risk"] += 1
+        else:
+            snapshot["sla_breached"] += 1
+
     return snapshot
 
 
-def answer_ask_wms(conn, question):
-    q = clean_display_text(question, "").lower()
+def create_ask_wms_conversation(conn, title="New conversation"):
+    c = conn.cursor()
+    stamp = now_pt().isoformat()
+    c.execute(
+        """
+        INSERT INTO ask_wms_conversations (title, created_at, updated_at)
+        VALUES (?, ?, ?)
+        """,
+        (clean_display_text(title, "New conversation")[:80], stamp, stamp),
+    )
+    return c.lastrowid
+
+
+def list_ask_wms_conversations(conn, limit=40):
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT id, title, created_at, updated_at
+        FROM ask_wms_conversations
+        ORDER BY datetime(updated_at) DESC, id DESC
+        LIMIT ?
+        """,
+        (max(1, int(limit)),),
+    )
+    return [
+        {
+            "id": row[0],
+            "title": clean_display_text(row[1], "Conversation"),
+            "created_at": row[2],
+            "updated_at": row[3],
+        }
+        for row in c.fetchall()
+    ]
+
+
+def get_ask_wms_conversation(conn, conversation_id):
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT id, title, created_at, updated_at
+        FROM ask_wms_conversations
+        WHERE id = ?
+        """,
+        (conversation_id,),
+    )
+    row = c.fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "title": clean_display_text(row[1], "Conversation"),
+        "created_at": row[2],
+        "updated_at": row[3],
+    }
+
+
+def touch_ask_wms_conversation(conn, conversation_id, title=None):
+    c = conn.cursor()
+    if title:
+        c.execute(
+            """
+            UPDATE ask_wms_conversations
+            SET title = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (clean_display_text(title, "Conversation")[:80], now_pt().isoformat(), conversation_id),
+        )
+    else:
+        c.execute(
+            """
+            UPDATE ask_wms_conversations
+            SET updated_at = ?
+            WHERE id = ?
+            """,
+            (now_pt().isoformat(), conversation_id),
+        )
+
+
+def save_ask_wms_message(conn, conversation_id, role, message, meta=None):
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO ask_wms_chat (conversation_id, created_at, role, message, meta_json)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            conversation_id,
+            now_pt().isoformat(),
+            clean_display_text(role, "assistant"),
+            message or "",
+            json.dumps(meta or {}),
+        ),
+    )
+    touch_ask_wms_conversation(conn, conversation_id)
+
+
+def list_ask_wms_chat(conn, conversation_id, limit=120):
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT id, created_at, role, message, meta_json
+        FROM ask_wms_chat
+        WHERE conversation_id = ?
+        ORDER BY id ASC
+        LIMIT ?
+        """,
+        (conversation_id, max(1, int(limit))),
+    )
+    rows = []
+    for row_id, created_at, role, message, meta_json in c.fetchall():
+        try:
+            meta = json.loads(meta_json) if meta_json else {}
+        except Exception:
+            meta = {}
+        rows.append(
+            {
+                "id": row_id,
+                "created_at": created_at,
+                "role": clean_display_text(role, "assistant"),
+                "message": message or "",
+                "meta": meta if isinstance(meta, dict) else {},
+            }
+        )
+    return rows
+
+
+def clear_ask_wms_chat(conn, conversation_id=None):
+    c = conn.cursor()
+    if conversation_id:
+        c.execute("DELETE FROM ask_wms_chat WHERE conversation_id = ?", (conversation_id,))
+        c.execute("DELETE FROM ask_wms_conversations WHERE id = ?", (conversation_id,))
+    else:
+        c.execute("DELETE FROM ask_wms_chat")
+        c.execute("DELETE FROM ask_wms_conversations")
+    return c.rowcount
+
+
+def compose_ask_response(headline, bullets=None, follow_up=""):
+    safe_headline = html_escape(clean_display_text(headline, ""))
+    html = f"<p class='ask-headline'>{safe_headline}</p>"
+    clean_bullets = [clean_display_text(item, "") for item in (bullets or []) if clean_display_text(item, "")]
+    if clean_bullets:
+        items = "".join(f"<li>{html_escape(item)}</li>" for item in clean_bullets[:5])
+        html += f"<ul class='ask-bullets'>{items}</ul>"
+    if follow_up:
+        html += f"<p class='ask-followup'><strong>Next:</strong> {html_escape(clean_display_text(follow_up, ''))}</p>"
+    return html
+
+
+def normalize_ask_question(question):
+    text = clean_display_text(question, "").lower()
+    text = text.replace("on-hand", "on hand").replace("onhand", "on hand")
+    text = re.sub(r"[^\w\s/\-:]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    spelling_map = {
+        "shiped": "shipped",
+        "shippd": "shipped",
+        "shiiped": "shipped",
+        "completd": "completed",
+        "recieved": "received",
+        "recive": "received",
+        "inventroy": "inventory",
+        "inventor": "inventory",
+        "avaliable": "available",
+        "availible": "available",
+        "quanity": "quantity",
+        "qantity": "quantity",
+        "qty": "quantity",
+        "superviser": "supervisor",
+        "supervisr": "supervisor",
+        "verificaton": "verification",
+        "verfication": "verification",
+        "pendng": "pending",
+        "blockd": "blocked",
+        "shortge": "shortage",
+        "shortages": "shortage",
+        "pickers": "picker",
+        "orders": "order",
+        "skus": "sku",
+        "parts": "part",
+        "pn": "part",
+        "procurement": "planner",
+        "dashbord": "dashboard",
+        "exective": "executive",
+        "tommorow": "tomorrow",
+        "yesturday": "yesterday",
+    }
+    tokens = []
+    for token in text.split():
+        tokens.append(spelling_map.get(token, token))
+    return " ".join(tokens)
+
+
+def extract_ask_sku(normalized_question, original_question=""):
+    for source in (original_question, normalized_question):
+        match = re.search(r"\b(?:sku|part|item|pn)?\s*#?\s*([0-9]{4,6})\b", source, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def extract_ask_date(normalized_question):
+    now = now_pt()
+    q = normalized_question
+
+    if "today" in q:
+        return now.date(), "today"
+    if "yesterday" in q:
+        return (now - timedelta(days=1)).date(), "yesterday"
+
+    iso_match = re.search(r"\b(20\d{2})-(\d{1,2})-(\d{1,2})\b", q)
+    if iso_match:
+        year, month, day = map(int, iso_match.groups())
+        try:
+            return datetime(year, month, day, tzinfo=PACIFIC_TZ).date(), f"{year:04d}-{month:02d}-{day:02d}"
+        except ValueError:
+            pass
+
+    us_match = re.search(r"\b(\d{1,2})/(\d{1,2})/(20\d{2})\b", q)
+    if us_match:
+        month, day, year = map(int, us_match.groups())
+        try:
+            return datetime(year, month, day, tzinfo=PACIFIC_TZ).date(), f"{year:04d}-{month:02d}-{day:02d}"
+        except ValueError:
+            pass
+
+    month_map = {
+        "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+        "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+        "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+        "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+    }
+    month_match = re.search(
+        r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|"
+        r"aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+        r"\s+(\d{1,2})(?:,?\s*(20\d{2}))?\b",
+        q,
+    )
+    if month_match:
+        month_token = month_match.group(1)
+        month = month_map.get(month_token) or month_map.get(month_token[:3])
+        day = int(month_match.group(2))
+        year = int(month_match.group(3) or now.year)
+        if month:
+            try:
+                return datetime(year, month, day, tzinfo=PACIFIC_TZ).date(), f"{year:04d}-{month:02d}-{day:02d}"
+            except ValueError:
+                pass
+
+    return None, ""
+
+
+def extract_requested_qty(normalized_question):
+    patterns = [
+        r"\b(?:for|of|need|needs|request(?:ing)?|order(?:ing)?)\s+(\d{1,6})\b",
+        r"\b(\d{1,6})\s+(?:units?|parts?|qty|quantity)\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, normalized_question)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def classify_ask_intent(normalized_question):
+    q = normalized_question
+    scores = {
+        "summary": 0,
+        "executive": 0,
+        "planner": 0,
+        "inventory": 0,
+        "operations": 0,
+        "quality": 0,
+        "supervisor": 0,
+        "unknown": 0,
+    }
+
+    def bump(intent, weight=1):
+        scores[intent] += weight
+
+    if any(token in q for token in ("summary", "summarize", "overview", "snapshot", "executive dashboard", "how is the warehouse")):
+        bump("summary", 4)
+    if any(token in q for token in ("dashboard", "kpi", "sla", "shipped", "received", "pending order", "inventory value")):
+        bump("executive", 3)
+    if any(token in q for token in ("planner", "procurement", "destination", "urgency", "can we order", "support a request")):
+        bump("planner", 3)
+    if any(token in q for token in ("inventory", "stock", "on hand", "available", "part", "sku", "low stock", "overstock", "warehouse value", "most", "least", "highest", "lowest", "top")):
+        bump("inventory", 3)
+    if any(token in q for token in ("most inventory", "highest stock", "top sku", "part number", "which part", "which sku")):
+        bump("inventory", 4)
+    if any(token in q for token in ("operation", "picker", "picking", "blocked", "shortage", "workboard", "workload", "behind")):
+        bump("operations", 3)
+    if any(token in q for token in ("quality", "verification", "audit", "qa", "defect", "damage", "pass rate")):
+        bump("quality", 3)
+    if any(token in q for token in ("supervisor", "escalation", "root cause", "corrective")):
+        bump("supervisor", 3)
+
+    if "shipped" in q or "completed" in q:
+        bump("executive", 2)
+    if "blocked" in q or "shortage" in q:
+        bump("operations", 2)
+    if "verification" in q:
+        bump("quality", 2)
+
+    best_intent = max(scores, key=scores.get)
+    if scores[best_intent] <= 0:
+        return "unknown"
+    return best_intent
+
+
+def _ask_date_bounds(day_value):
+    start = datetime(day_value.year, day_value.month, day_value.day, tzinfo=PACIFIC_TZ)
+    end = start + timedelta(days=1)
+    return start.isoformat(), end.isoformat()
+
+
+def extract_ask_top_n(normalized_question, default=1):
+    match = re.search(r"\btop\s+(\d{1,2})\b", normalized_question)
+    if match:
+        return max(1, min(int(match.group(1)), 20))
+    if any(token in normalized_question for token in ("top", "runners up", "runner up", "leaderboard")):
+        return 5
+    return default
+
+
+def detect_inventory_ranking_intent(normalized_question):
+    q = normalized_question
+    inventoryish = any(
+        token in q
+        for token in ("inventory", "stock", "on hand", "part", "sku", "item", "quantity", "units")
+    )
+    mostish = any(token in q for token in ("most", "highest", "largest", "greatest", "top", "biggest"))
+    leastish = any(token in q for token in ("least", "lowest", "smallest", "fewest", "minimum"))
+    valueish = "value" in q or "dollar" in q or "worth" in q
+    which_part = ("which" in q or "what" in q) and any(token in q for token in ("part", "sku", "item"))
+    if not inventoryish and not which_part:
+        return None
+    if leastish:
+        return "least_qty"
+    if valueish and (mostish or "top" in q or which_part):
+        return "most_value"
+    if mostish or which_part:
+        return "most_qty"
+    return None
+
+
+def query_sku_inventory_ranks(conn, mode="most_qty", limit=5):
+    c = conn.cursor()
+    limit = max(1, min(int(limit or 5), 20))
+    if mode == "most_value":
+        order_sql = "ORDER BY val DESC, qty DESC, sku ASC"
+    elif mode == "least_qty":
+        order_sql = "ORDER BY qty ASC, sku ASC"
+    else:
+        order_sql = "ORDER BY qty DESC, val DESC, sku ASC"
+
+    c.execute(
+        f"""
+        SELECT
+            sku,
+            COALESCE(SUM(quantity), 0) AS qty,
+            COALESCE(SUM(CAST(quantity AS REAL) * price), 0) AS val
+        FROM inventory
+        WHERE quantity > 0
+          AND TRIM(COALESCE(sku, '')) <> ''
+        GROUP BY sku
+        {order_sql}
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    rows = []
+    for sku, qty, val in c.fetchall():
+        rows.append(
+            {
+                "sku": clean_display_text(sku, ""),
+                "qty": int(qty or 0),
+                "value": float(val or 0),
+                "description": sku_semiconductor_description(sku),
+            }
+        )
+    return rows
+
+
+def answer_ask_wms(conn, question, prior_context=None, debug=False):
+    """Executive Ask WMS entrypoint: zero-paid-API intent engine over session DB."""
+    import wms_ask_engine
+
+    answer_html, snapshot, context = wms_ask_engine.answer_question(
+        conn,
+        question,
+        prior_context=prior_context or {},
+        warehouses=list(WAREHOUSE_NETWORK),
+        source_warehouse=SOURCE_WAREHOUSE,
+        low_stock_threshold=DEFAULT_LOW_STOCK_ALERT_THRESHOLD,
+        shortage_issue_type=SHORTAGE_ISSUE_TYPE,
+        now_pt=now_pt,
+        parse_order_datetime=parse_order_datetime,
+        normalize_urgency=normalize_urgency,
+        calculate_sla_status=calculate_sla_status,
+        sku_description=sku_semiconductor_description,
+        debug=debug,
+    )
+    return answer_html, snapshot, context
+
+
+def _answer_ask_wms_legacy(conn, question):
+    original = clean_display_text(question, "")
+    q = normalize_ask_question(original)
+    # Keep multi-word phrases useful for ranking detection.
+    q = q.replace("part number", "part").replace("part no", "part").replace("item number", "part")
     c = conn.cursor()
     snapshot = build_ops_snapshot(conn)
 
     if not q:
-        return (
-            "Ask about shortages, inventory, verification queue, picker workload, quality issues, or request an operations summary.",
-            snapshot,
+        return compose_ask_response(
+            "Ask a warehouse question and I will answer from this demo session's live data.",
+            [
+                "Try shipped counts by date, SKU availability, blocked orders, quality queues, or SLA risk.",
+            ],
+            "Ask: How many orders shipped today?",
+        ), snapshot, {"intent": "unknown"}
+
+    sku_value = extract_ask_sku(q, original)
+    day_value, day_label = extract_ask_date(q)
+    requested_qty = extract_requested_qty(q)
+    intent = classify_ask_intent(q)
+    ranking_mode = detect_inventory_ranking_intent(q)
+    top_n = extract_ask_top_n(q, default=5 if "top" in q else 1)
+    meta = {"intent": intent, "sku": sku_value, "date": day_label, "ranking": ranking_mode}
+
+    # Catalog-level SKU count ("how many SKUs available/active?")
+    asks_sku_catalog_count = (
+        not sku_value
+        and "sku" in q
+        and (
+            "how many" in q
+            or "number of" in q
+            or "count of" in q
+            or q.startswith("sku available")
+            or "skus available" in original.lower()
         )
+        and any(
+            token in q
+            for token in (
+                "available",
+                "active",
+                "total",
+                "in inventory",
+                "in stock",
+                "do we have",
+                "are there",
+                "have",
+            )
+        )
+    )
+    if asks_sku_catalog_count or (not sku_value and re.search(r"\bhow many sku\b", q)):
+        return compose_ask_response(
+            f"There are {snapshot['sku_count']} active SKUs available in this demo warehouse.",
+            [
+                f"Total units on hand: {snapshot['units_on_hand']:,}",
+                f"Inventory value: ${snapshot['inventory_value']:,.2f}",
+            ],
+            "Ask which part number has the most inventory.",
+        ), snapshot, {"intent": "inventory", "sku": ""}
 
-    sku_match = re.search(r"\b(sku\s*)?([0-9]{4,6})\b", q)
-    sku_value = sku_match.group(2) if sku_match else ""
+    # Ranking: most/least/top inventory by qty or value
+    if ranking_mode and not sku_value:
+        rows = query_sku_inventory_ranks(conn, mode=ranking_mode, limit=max(top_n, 5))
+        if not rows:
+            return compose_ask_response(
+                "No positive on-hand inventory was found in this demo session.",
+                [],
+                "Ask how many SKUs are available.",
+            ), snapshot, meta
 
-    if any(token in q for token in ("summarize", "summary", "overview", "how is", "status of the warehouse", "today")):
-        lines = [
-            f"Operations snapshot: {snapshot['orders_total']} total orders "
-            f"({snapshot['orders_placed']} placed, {snapshot['picking']} picking, "
-            f"{snapshot['pending_verification']} pending verification, {snapshot['completed']} completed).",
-            f"Exceptions: {snapshot['blocked']} blocked by shortage, {snapshot['quality_issue']} quality-issue orders, "
-            f"{snapshot['open_quality_issues']} open supervisor quality cases.",
-            f"Inventory: {snapshot['sku_count']} active SKUs / {snapshot['units_on_hand']:,} units on hand.",
-        ]
-        return " ".join(lines), snapshot
+        lead = rows[0]
+        if ranking_mode == "least_qty":
+            headline = (
+                f"SKU {lead['sku']} has the least inventory with {lead['qty']:,} unit(s)."
+            )
+            follow = "Ask for low-stock SKUs below the alert threshold."
+        elif ranking_mode == "most_value":
+            headline = (
+                f"SKU {lead['sku']} has the highest inventory value at ${lead['value']:,.2f}."
+            )
+            follow = "Ask for the top 5 SKUs by inventory value."
+        else:
+            headline = (
+                f"SKU {lead['sku']} has the most inventory with {lead['qty']:,} unit(s)."
+            )
+            follow = "Ask for the top 5 SKUs by on-hand quantity."
 
-    if any(token in q for token in ("blocked", "shortage", "shortages", "out of stock")):
+        show_n = top_n if top_n > 1 else min(4, len(rows))
+        bullets = [f"{lead['sku']}: {lead['description']}"]
+        if ranking_mode == "most_value":
+            bullets.extend(
+                f"#{idx}. SKU {row['sku']}: ${row['value']:,.2f} ({row['qty']:,} units)"
+                for idx, row in enumerate(rows[:show_n], start=1)
+            )
+        else:
+            bullets.extend(
+                f"#{idx}. SKU {row['sku']}: {row['qty']:,} units"
+                for idx, row in enumerate(rows[:show_n], start=1)
+            )
+        bullets.append(f"Active SKUs in catalog: {snapshot['sku_count']}")
+        return compose_ask_response(headline, bullets, follow), snapshot, meta
+
+    # Inventory / part availability (highest precision for LinkedIn demos)
+    if sku_value and (
+        intent in {"inventory", "planner", "unknown"}
+        or any(token in q for token in ("part", "sku", "stock", "on hand", "available", "left", "remain", "quantity"))
+    ):
+        available = get_available_inventory_qty(conn, sku_value, SOURCE_WAREHOUSE)
+        warehouse, location, best_qty = get_best_inventory_location(conn, sku_value, SOURCE_WAREHOUSE)
+        description = sku_semiconductor_description(sku_value)
         c.execute(
             """
-            SELECT order_number, status, responsibility
+            SELECT warehouse, COALESCE(SUM(quantity), 0)
+            FROM inventory
+            WHERE sku = ? AND quantity > 0
+            GROUP BY warehouse
+            ORDER BY SUM(quantity) DESC
+            """,
+            (sku_value,),
+        )
+        by_wh = c.fetchall()
+        bullets = [
+            f"Source warehouse ({SOURCE_WAREHOUSE}): {available} unit(s)",
+            f"Best pick location: {location} at {warehouse} ({best_qty} on hand)",
+        ]
+        if by_wh:
+            bullets.append(
+                "Network on-hand: "
+                + ", ".join(f"{clean_display_text(wh, 'Warehouse')}: {int(qty)}" for wh, qty in by_wh[:4])
+            )
+        follow = f"Ask whether SKU {sku_value} can support a specific order quantity."
+        if requested_qty is not None:
+            if requested_qty <= available:
+                headline = (
+                    f"SKU {sku_value} ({description}) can support {requested_qty} unit(s). "
+                    f"Available at source: {available} unit(s)."
+                )
+            else:
+                headline = (
+                    f"SKU {sku_value} ({description}) cannot support {requested_qty} unit(s). "
+                    f"Only {available} unit(s) are available at {SOURCE_WAREHOUSE}."
+                )
+            follow = "Open Planner to place an order within available quantity."
+        else:
+            headline = (
+                f"SKU {sku_value} ({description}) has {available} part(s)/unit(s) left at {SOURCE_WAREHOUSE}."
+            )
+        return compose_ask_response(headline, bullets, follow), snapshot, meta
+
+    # Shipped / completed by date
+    if any(token in q for token in ("shipped", "completed", "closed")) and (
+        "order" in q or "how many" in q or day_value is not None or "today" in q or "yesterday" in q
+    ):
+        if day_value is None:
+            day_value = now_pt().date()
+            day_label = "today"
+            meta["assumption"] = "Interpreted missing date as today."
+        start_iso, end_iso = _ask_date_bounds(day_value)
+        c.execute(
+            """
+            SELECT COUNT(*)
+            FROM order_header
+            WHERE status = 'Completed'
+              AND date >= ?
+              AND date < ?
+            """,
+            (start_iso, end_iso),
+        )
+        shipped_count = int(c.fetchone()[0] or 0)
+        c.execute(
+            """
+            SELECT order_number
+            FROM order_header
+            WHERE status = 'Completed'
+              AND date >= ?
+              AND date < ?
+            ORDER BY date DESC
+            LIMIT 8
+            """,
+            (start_iso, end_iso),
+        )
+        sample = [row[0] for row in c.fetchall()]
+        bullets = [f"Filter used: status=Completed, date={day_label}"]
+        if sample:
+            bullets.append("Sample orders: " + ", ".join(sample))
+        if meta.get("assumption"):
+            bullets.append(meta["assumption"])
+        return compose_ask_response(
+            f"{shipped_count} order(s) shipped/completed on {day_label}.",
+            bullets,
+            "Ask for orders received on the same date for inflow vs outflow.",
+        ), snapshot, meta
+
+    # Orders received by date
+    if any(token in q for token in ("received", "placed", "created")) and ("order" in q or "how many" in q):
+        if day_value is None:
+            day_value = now_pt().date()
+            day_label = "today"
+            meta["assumption"] = "Interpreted missing date as today."
+        start_iso, end_iso = _ask_date_bounds(day_value)
+        c.execute(
+            """
+            SELECT COUNT(*)
+            FROM order_header
+            WHERE date >= ? AND date < ?
+            """,
+            (start_iso, end_iso),
+        )
+        received_count = int(c.fetchone()[0] or 0)
+        bullets = [f"Filter used: all orders with created date={day_label}"]
+        if meta.get("assumption"):
+            bullets.append(meta["assumption"])
+        return compose_ask_response(
+            f"{received_count} order(s) were received/created on {day_label}.",
+            bullets,
+            "Ask how many of those are still pending or already shipped.",
+        ), snapshot, meta
+
+    # Summary / executive overview
+    if intent in {"summary", "executive"} or any(token in q for token in ("summary", "summarize", "overview", "dashboard")):
+        open_orders = max(snapshot["orders_total"] - snapshot["completed"], 0)
+        pick_accuracy = (
+            round((snapshot["audits_passed"] / snapshot["audits_total"]) * 100, 1)
+            if snapshot["audits_total"]
+            else 100.0
+        )
+        return compose_ask_response(
+            (
+                f"Executive snapshot: {open_orders} open order(s), {snapshot['completed']} completed, "
+                f"{snapshot['blocked']} blocked, and inventory valued at ${snapshot['inventory_value']:,.2f}."
+            ),
+            [
+                f"Pipeline: {snapshot['orders_placed']} placed, {snapshot['picking']} picking, {snapshot['pending_verification']} pending verification.",
+                f"SLA risk on open work: {snapshot['sla_healthy']} healthy, {snapshot['sla_at_risk']} at risk, {snapshot['sla_breached']} breached.",
+                f"Quality: {snapshot['open_quality_issues']} open quality case(s); pick audit accuracy {pick_accuracy}% ({snapshot['audits_passed']}/{snapshot['audits_total']}).",
+                f"Inventory: {snapshot['sku_count']} active SKUs / {snapshot['units_on_hand']:,} units on hand.",
+            ],
+            "Ask which orders are blocked or which SKUs are low stock.",
+        ), snapshot, meta
+
+    # Blocked / shortage operations
+    if any(token in q for token in ("blocked", "shortage", "short")):
+        c.execute(
+            """
+            SELECT order_number, responsibility, date
             FROM order_header
             WHERE status = 'Blocked'
             ORDER BY date DESC
@@ -4870,21 +5785,19 @@ def answer_ask_wms(conn, question):
         )
         rows = c.fetchall()
         if not rows:
-            return "No orders are currently blocked by shortage in this demo session.", snapshot
-        listing = ", ".join(f"{row[0]} ({row[2]})" for row in rows)
-        return f"{len(rows)} blocked order(s): {listing}. Inventory can restock and Supervisor can release shortages.", snapshot
+            return compose_ask_response(
+                "0 orders are currently blocked by shortage in this demo session.",
+                [f"Open shortage escalations in Supervisor: {snapshot['open_shortage_issues']}"],
+                "Ask for low-stock SKUs that may create the next shortage.",
+            ), snapshot, meta
+        return compose_ask_response(
+            f"{len(rows)} order(s) are blocked by shortage.",
+            [f"{order_number} (owner: {responsibility})" for order_number, responsibility, _ in rows[:8]],
+            "Open Inventory to restock blocked SKUs, then confirm release in Supervisor.",
+        ), snapshot, meta
 
-    if sku_value and any(token in q for token in ("on-hand", "on hand", "inventory", "stock", "available", "qty", "quantity")):
-        available = get_available_inventory_qty(conn, sku_value, SOURCE_WAREHOUSE)
-        _, location, best_qty = get_best_inventory_location(conn, sku_value, SOURCE_WAREHOUSE)
-        description = sku_semiconductor_description(sku_value)
-        return (
-            f"SKU {sku_value} ({description}) has {available} unit(s) available at {SOURCE_WAREHOUSE}. "
-            f"Best pick location: {location} with {best_qty} on hand.",
-            snapshot,
-        )
-
-    if any(token in q for token in ("pending verification", "verification", "quality queue", "to verify")):
+    # Pending verification / quality queue
+    if any(token in q for token in ("pending verification", "verification", "to verify", "quality queue")):
         c.execute(
             """
             SELECT order_number, date
@@ -4896,11 +5809,92 @@ def answer_ask_wms(conn, question):
         )
         rows = c.fetchall()
         if not rows:
-            return "No orders are pending quality verification right now.", snapshot
-        listing = ", ".join(row[0] for row in rows)
-        return f"{len(rows)} order(s) pending verification: {listing}.", snapshot
+            return compose_ask_response(
+                "0 orders are pending quality verification right now.",
+                [f"Open quality cases in Supervisor: {snapshot['open_quality_issues']}"],
+                "Ask for pick accuracy or failed audits.",
+            ), snapshot, meta
+        return compose_ask_response(
+            f"{len(rows)} order(s) are pending verification.",
+            [row[0] for row in rows[:8]],
+            "Open Quality to verify the oldest pending order first.",
+        ), snapshot, meta
 
-    if any(token in q for token in ("picker", "pickers", "behind", "workload", "productivity")):
+    # Quality issues / audits
+    if intent == "quality" or any(token in q for token in ("quality issue", "failed audit", "defect", "damage", "pass rate", "audit")):
+        if "pass" in q or "accuracy" in q or "audit" in q:
+            accuracy = (
+                round((snapshot["audits_passed"] / snapshot["audits_total"]) * 100, 1)
+                if snapshot["audits_total"]
+                else 100.0
+            )
+            return compose_ask_response(
+                f"Pick audit accuracy is {accuracy}% based on {snapshot['audits_total']} audit(s).",
+                [
+                    f"Passed: {snapshot['audits_passed']}",
+                    f"Failed: {snapshot['audits_failed']}",
+                    f"Open quality cases: {snapshot['open_quality_issues']}",
+                ],
+                "Ask for the open quality issue list.",
+            ), snapshot, meta
+
+        c.execute(
+            """
+            SELECT issue_id, order_number, issue_type, issue_status
+            FROM supervisor_quality_issues
+            WHERE issue_status NOT IN ('Closed', 'Resolved')
+              AND COALESCE(issue_type, '') != ?
+            ORDER BY issue_date DESC
+            LIMIT 10
+            """,
+            (SHORTAGE_ISSUE_TYPE,),
+        )
+        rows = c.fetchall()
+        if not rows:
+            return compose_ask_response(
+                "0 open quality issues in Supervisor right now.",
+                [f"Failed audits on record: {snapshot['audits_failed']}"],
+                "Ask for pending verification volume.",
+            ), snapshot, meta
+        return compose_ask_response(
+            f"{len(rows)} open quality issue(s) require supervisor attention.",
+            [f"{issue_id} on {order_number} ({issue_type} / {status})" for issue_id, order_number, issue_type, status in rows],
+            "Open Supervisor to assign root cause and corrective action.",
+        ), snapshot, meta
+
+    # Supervisor escalations
+    if intent == "supervisor" or any(token in q for token in ("escalation", "supervisor")):
+        c.execute(
+            """
+            SELECT issue_id, order_number, issue_type, issue_status, assigned_to
+            FROM supervisor_quality_issues
+            WHERE issue_status NOT IN ('Closed', 'Resolved')
+            ORDER BY issue_date DESC
+            LIMIT 12
+            """
+        )
+        rows = c.fetchall()
+        if not rows:
+            return compose_ask_response(
+                "0 open supervisor escalations in this demo session.",
+                [
+                    f"Blocked orders: {snapshot['blocked']}",
+                    f"Pending verification: {snapshot['pending_verification']}",
+                ],
+                "Ask for SLA breached orders.",
+            ), snapshot, meta
+        return compose_ask_response(
+            f"{len(rows)} open supervisor escalation(s).",
+            [
+                f"{issue_id} / {order_number}: {issue_type} ({status})"
+                + (f", owner {assigned}" if clean_display_text(assigned, "") else "")
+                for issue_id, order_number, issue_type, status, assigned in rows
+            ],
+            "Filter Supervisor by Blocked vs Quality Issue for focused action.",
+        ), snapshot, meta
+
+    # Picker workload
+    if any(token in q for token in ("picker", "behind", "workload", "productivity", "picking in progress")):
         c.execute(
             """
             SELECT COALESCE(user_role, 'Unassigned') AS picker_name,
@@ -4913,117 +5907,431 @@ def answer_ask_wms(conn, question):
             """
         )
         rows = c.fetchall()
-        if not rows:
-            c.execute(
-                """
-                SELECT COUNT(*) FROM order_header
-                WHERE status IN ('Orders Placed', 'Picking in Progress')
-                """
-            )
-            open_picks = int(c.fetchone()[0] or 0)
-            return (
-                f"No pick transactions yet in this session. {open_picks} order(s) are waiting in the Operations queue.",
-                snapshot,
-            )
-        listing = ", ".join(f"{clean_display_text(name, 'Unknown')} ({count} picks)" for name, count in rows)
-        return f"Lowest pick activity so far: {listing}. Compare against the Operations workboard for live assignments.", snapshot
-
-    if any(token in q for token in ("quality issue", "quality issues", "failed audit", "defect", "damage")):
         c.execute(
             """
-            SELECT issue_id, order_number, issue_type, issue_status
-            FROM supervisor_quality_issues
-            WHERE issue_status NOT IN ('Closed', 'Resolved')
-            ORDER BY issue_date DESC
-            LIMIT 10
+            SELECT COUNT(*) FROM order_header
+            WHERE status IN ('Orders Placed', 'Picking in Progress')
+            """
+        )
+        open_picks = int(c.fetchone()[0] or 0)
+        if not rows:
+            return compose_ask_response(
+                f"No pick transactions yet. {open_picks} order(s) are waiting in Operations.",
+                [f"Orders placed: {snapshot['orders_placed']}", f"Picking in progress: {snapshot['picking']}"],
+                "Assign a picker on the Operations workboard.",
+            ), snapshot, meta
+        return compose_ask_response(
+            "Picker activity ranked from lowest to highest pick volume:",
+            [f"{clean_display_text(name, 'Unknown')}: {count} pick event(s)" for name, count in rows],
+            "Compare this with live assignments on Operations.",
+        ), snapshot, meta
+
+    # Low stock / overstock
+    if "low stock" in q or "overstock" in q or ("stock" in q and "low" in q):
+        threshold = DEFAULT_LOW_STOCK_ALERT_THRESHOLD
+        if "overstock" in q:
+            c.execute(
+                """
+                SELECT sku, SUM(quantity) AS tq
+                FROM inventory
+                GROUP BY sku
+                HAVING tq > 5000
+                ORDER BY tq DESC
+                LIMIT 8
+                """
+            )
+            rows = c.fetchall()
+            if not rows:
+                return compose_ask_response(
+                    "0 overstock SKUs found (threshold > 5000 units).",
+                    [],
+                    "Ask for low-stock SKUs instead.",
+                ), snapshot, meta
+            return compose_ask_response(
+                f"{len(rows)} overstock SKU(s) above 5000 units.",
+                [f"SKU {sku}: {int(qty)} units" for sku, qty in rows],
+                "Review Inventory value concentration on the Executive dashboard.",
+            ), snapshot, meta
+
+        c.execute(
+            """
+            SELECT sku, SUM(quantity) AS tq
+            FROM inventory
+            GROUP BY sku
+            HAVING tq > 0 AND tq < ?
+            ORDER BY tq ASC
+            LIMIT 8
+            """,
+            (threshold,),
+        )
+        rows = c.fetchall()
+        if not rows:
+            return compose_ask_response(
+                f"0 low-stock SKUs below {threshold} units.",
+                [],
+                "Ask inventory value by warehouse.",
+            ), snapshot, meta
+        return compose_ask_response(
+            f"{len(rows)} low-stock SKU(s) below {threshold} units.",
+            [f"SKU {sku}: {int(qty)} units" for sku, qty in rows],
+            "Restock from Inventory before these become blocked-order shortages.",
+        ), snapshot, meta
+
+    # Inventory value by warehouse
+    if "inventory value" in q or ("value" in q and "warehouse" in q) or ("value by warehouse" in q):
+        c.execute(
+            """
+            SELECT warehouse, COALESCE(SUM(CAST(quantity AS REAL) * price), 0) AS val
+            FROM inventory
+            WHERE quantity > 0
+            GROUP BY warehouse
+            ORDER BY val DESC
             """
         )
         rows = c.fetchall()
         if not rows:
-            return "No open quality issues in Supervisor right now.", snapshot
-        listing = ", ".join(f"{row[0]} on {row[1]} ({row[2]} / {row[3]})" for row in rows)
-        return f"{len(rows)} open quality issue(s): {listing}.", snapshot
+            return compose_ask_response(
+                "No inventory valuation data is available in this demo session.",
+                [],
+                "Ask for active SKU count.",
+            ), snapshot, meta
+        return compose_ask_response(
+            f"Total inventory value is ${snapshot['inventory_value']:,.2f} across {len(rows)} warehouse(s).",
+            [f"{clean_display_text(wh, 'Warehouse')}: ${float(val):,.2f}" for wh, val in rows],
+            "Ask which SKUs contribute the most inventory value.",
+        ), snapshot, meta
 
-    if sku_value:
-        available = get_available_inventory_qty(conn, sku_value, SOURCE_WAREHOUSE)
-        return (
-            f"SKU {sku_value} ({sku_semiconductor_description(sku_value)}) currently shows {available} available unit(s) at {SOURCE_WAREHOUSE}.",
-            snapshot,
+    # Planner / urgency / destinations
+    if intent == "planner" or any(token in q for token in ("destination", "urgency", "planner", "procurement")):
+        c.execute(
+            """
+            SELECT destination, COUNT(*)
+            FROM order_header
+            GROUP BY destination
+            ORDER BY COUNT(*) DESC
+            """
         )
+        dest_rows = c.fetchall()
+        c.execute(
+            """
+            SELECT urgency, COUNT(*)
+            FROM order_header
+            GROUP BY urgency
+            ORDER BY COUNT(*) DESC
+            """
+        )
+        urgency_rows = c.fetchall()
+        return compose_ask_response(
+            f"Planner queue holds {snapshot['orders_total']} order(s) in this demo session "
+            f"({snapshot['orders_placed']} currently in Orders Placed).",
+            [
+                "Destinations: "
+                + (", ".join(f"{clean_display_text(dest, 'Unknown')}: {count}" for dest, count in dest_rows[:4]) or "none"),
+                "Urgency mix: "
+                + (
+                    ", ".join(
+                        f"{normalize_urgency(urgency, 'Standard')}: {count}"
+                        for urgency, count in urgency_rows[:4]
+                    )
+                    or "none"
+                ),
+            ],
+            "Ask whether a specific SKU can support a requested quantity.",
+        ), snapshot, meta
 
-    return (
-        "I can answer shortage, inventory, verification, picker, quality, and summary questions using this session's live warehouse data. "
-        "Try one of the suggested prompts below.",
-        snapshot,
-    )
+    # SLA questions
+    if "sla" in q:
+        open_orders = snapshot["sla_healthy"] + snapshot["sla_at_risk"] + snapshot["sla_breached"]
+        return compose_ask_response(
+            f"SLA on {open_orders} open order(s): {snapshot['sla_healthy']} healthy, "
+            f"{snapshot['sla_at_risk']} at risk, {snapshot['sla_breached']} breached.",
+            [
+                f"Blocked orders: {snapshot['blocked']}",
+                f"Pending verification: {snapshot['pending_verification']}",
+            ],
+            "Ask for blocked orders if breach risk is tied to shortages.",
+        ), snapshot, meta
+
+    # Pending / open orders
+    if "pending" in q and "verification" not in q:
+        open_orders = max(snapshot["orders_total"] - snapshot["completed"], 0)
+        return compose_ask_response(
+            f"{open_orders} order(s) are pending (not completed).",
+            [
+                f"Orders Placed: {snapshot['orders_placed']}",
+                f"Picking in Progress: {snapshot['picking']}",
+                f"Pending Verification: {snapshot['pending_verification']}",
+                f"Blocked: {snapshot['blocked']}",
+                f"Quality Issue: {snapshot['quality_issue']}",
+            ],
+            "Ask for the blocked-order list or pending verification list.",
+        ), snapshot, meta
+
+    # Last-chance intelligent fallbacks before help menu
+    if any(token in q for token in ("inventory", "stock", "part", "sku", "on hand")):
+        rows = query_sku_inventory_ranks(conn, mode="most_qty", limit=5)
+        if rows:
+            lead = rows[0]
+            return compose_ask_response(
+                (
+                    f"Interpreted as an inventory ranking question: "
+                    f"SKU {lead['sku']} currently leads with {lead['qty']:,} unit(s)."
+                ),
+                [
+                    f"{lead['sku']}: {lead['description']}",
+                    *[f"SKU {row['sku']}: {row['qty']:,} units" for row in rows[1:4]],
+                    "Assumption: ranked by total on-hand quantity across warehouses.",
+                ],
+                "Ask which SKU has the highest inventory value.",
+            ), snapshot, {"intent": "inventory", "ranking": "most_qty", "assumption": True}
+
+    if any(token in q for token in ("order", "warehouse", "operation", "quality", "supervisor", "dashboard")):
+        open_orders = max(snapshot["orders_total"] - snapshot["completed"], 0)
+        return compose_ask_response(
+            (
+                f"Executive snapshot: {open_orders} open order(s), {snapshot['completed']} completed, "
+                f"{snapshot['blocked']} blocked, {snapshot['sku_count']} active SKUs."
+            ),
+            [
+                f"Pending verification: {snapshot['pending_verification']}",
+                f"Open quality cases: {snapshot['open_quality_issues']}",
+                f"Inventory value: ${snapshot['inventory_value']:,.2f}",
+            ],
+            "Ask a more specific question, e.g. which part number has the most inventory?",
+        ), snapshot, {"intent": "summary", "assumption": True}
+
+    # Fallback menu — only for truly vague asks
+    return compose_ask_response(
+        "I can answer exact warehouse questions from this demo session. Please include a subject like SKU, orders, quality, or inventory.",
+        [
+            "Inventory: which part has the most inventory, parts left for a SKU, low stock",
+            "Executive: shipped/received by date, SLA risk, inventory value",
+            "Operations: blocked orders, picker workload",
+            "Quality/Supervisor: pending verification, open escalations",
+        ],
+        "Try: Which part number has the most inventory?",
+    ), snapshot, meta
+
+
+@app.route("/ask-wms/new", methods=["POST", "GET"])
+def ask_wms_new_chat():
+    conn = get_conn()
+    conversation_id = create_ask_wms_conversation(conn, "New conversation")
+    conn.commit()
+    conn.close()
+    return redirect(f"/ask-wms?c={conversation_id}")
+
+
+@app.route("/ask-wms/clear-chat", methods=["POST"])
+def ask_wms_clear_chat():
+    conversation_id = request.form.get("conversation_id") or request.args.get("c")
+    conn = get_conn()
+    try:
+        conversation_id = int(conversation_id) if conversation_id else None
+    except (TypeError, ValueError):
+        conversation_id = None
+    clear_ask_wms_chat(conn, conversation_id)
+    conn.commit()
+    conn.close()
+    if conversation_id:
+        return redirect("/ask-wms")
+    return redirect("/ask-wms?chat_cleared=1")
 
 
 @app.route("/ask-wms", methods=["GET", "POST"])
 def ask_wms():
     question = ""
-    answer = ""
-    snapshot = None
+    conn = get_conn()
+
+    try:
+        conversation_id = int(request.values.get("c") or request.form.get("conversation_id") or 0)
+    except (TypeError, ValueError):
+        conversation_id = 0
+
+    conversations = list_ask_wms_conversations(conn)
+    active = get_ask_wms_conversation(conn, conversation_id) if conversation_id else None
+    if not active and conversations:
+        active = conversations[0]
+        conversation_id = active["id"]
+    if not active:
+        conversation_id = create_ask_wms_conversation(conn, "New conversation")
+        conn.commit()
+        active = get_ask_wms_conversation(conn, conversation_id)
+        conversations = list_ask_wms_conversations(conn)
 
     if request.method == "POST":
         question = clean_display_text(request.form.get("question"), "")
     elif request.args.get("q"):
         question = clean_display_text(request.args.get("q"), "")
 
-    conn = get_conn()
     if question:
-        answer, snapshot = answer_ask_wms(conn, question)
+        prior_context = session.get("ask_wms_context") or {}
+        debug_mode = request.args.get("ask_debug") == "1" or request.form.get("ask_debug") == "1"
+        answer_html, snapshot, context = answer_ask_wms(
+            conn,
+            question,
+            prior_context=prior_context,
+            debug=debug_mode,
+        )
+        session["ask_wms_context"] = {
+            "intent": context.get("intent"),
+            "entities": context.get("entities") or {},
+            "sku": context.get("sku"),
+            "order_id": context.get("order_id"),
+            "urgency": context.get("urgency"),
+        }
+        meta = {
+            "intent": context.get("intent"),
+            "entities": context.get("entities") or {},
+        }
+        # Rename untitled chats from the first user question.
+        if clean_display_text(active.get("title"), "") in {"", "New conversation", "Earlier conversation"}:
+            touch_ask_wms_conversation(conn, conversation_id, title=question)
+        save_ask_wms_message(conn, conversation_id, "user", question, {"source": "ask-wms"})
+        save_ask_wms_message(conn, conversation_id, "assistant", answer_html, meta)
+        conn.commit()
+        conversations = list_ask_wms_conversations(conn)
+        active = get_ask_wms_conversation(conn, conversation_id)
     else:
         snapshot = build_ops_snapshot(conn)
-        answer = (
-            "Ask WMS is a free, local Q&A layer over your private demo warehouse. "
-            "No login and no paid AI APIs — answers come straight from this session's SQLite data."
-        )
+
+    chat_rows = list_ask_wms_chat(conn, conversation_id)
     conn.close()
 
+    if not chat_rows:
+        welcome = compose_ask_response(
+            "Ask a warehouse question and I’ll answer from this demo session’s live data.",
+            follow_up="Example: How many SKUs are available?",
+        )
+        chat_rows = [
+            {
+                "id": 0,
+                "created_at": now_pt().isoformat(),
+                "role": "assistant",
+                "message": welcome,
+                "meta": {"intent": "welcome"},
+            }
+        ]
+
     suggestions = [
-        "Summarize today's operations",
-        "Which orders are blocked by shortage?",
-        "How many orders pending verification?",
-        "Any open quality issues?",
-        "Which pickers are behind?",
-        "What is on-hand for SKU 11000?",
+        "How is the warehouse performing today?",
+        "What needs supervisor attention right now?",
+        "How many orders shipped today?",
+        "Which orders are at risk of missing SLA?",
+        "Which part number has the most inventory?",
+        "What is our current quality pass rate?",
+        "What are the top three recommended actions?",
+        "Explain the order workflow",
+    ]
+    category_chips = [
+        ("Overview", "How is the warehouse performing today?"),
+        ("Orders", "How many orders are open?"),
+        ("SLA", "Which orders breached SLA?"),
+        ("Inventory", "Which SKUs are running low?"),
+        ("Operations", "Where is the largest operational backlog?"),
+        ("Quality", "Any open quality issues?"),
+        ("Shipping", "Anything ship today?"),
+        ("Supervisor", "What are the top three recommended actions?"),
     ]
     suggestion_html = "".join(
         f"<form method='post' style='display:inline;margin:0;'>"
-        f"<input type='hidden' name='question' value=\"{item}\">"
-        f"<button type='submit'>{item}</button></form>"
+        f"<input type='hidden' name='conversation_id' value='{conversation_id}'>"
+        f"<input type='hidden' name='question' value=\"{html_escape(item, quote=True)}\">"
+        f"<button type='submit'>{html_escape(item)}</button></form>"
         for item in suggestions
     )
+    chip_html = "".join(
+        f"<form method='post' style='display:inline;margin:0;'>"
+        f"<input type='hidden' name='conversation_id' value='{conversation_id}'>"
+        f"<input type='hidden' name='question' value=\"{html_escape(prompt, quote=True)}\">"
+        f"<button type='submit' class='ask-chip'>{html_escape(label)}</button></form>"
+        for label, prompt in category_chips
+    )
+
+    chat_html_parts = []
+    for row in chat_rows:
+        role = "user" if row["role"] == "user" else "assistant"
+        role_label = "You" if role == "user" else "Ask WMS"
+        stamp = format_pt_timestamp(row.get("created_at"), "-")
+        if role == "user":
+            body = f"<p class='ask-headline'>{html_escape(row.get('message', ''))}</p>"
+        else:
+            body = row.get("message", "")
+        chat_html_parts.append(
+            f"""
+            <div class='ask-bubble {role}'>
+                <div class='ask-bubble-role'>{role_label}</div>
+                {body}
+                <div class='ask-bubble-time'>{html_escape(stamp)}</div>
+            </div>
+            """
+        )
+    chat_transcript = "".join(chat_html_parts)
+
+    conversation_items = []
+    for item in conversations:
+        is_active = " active" if item["id"] == conversation_id else ""
+        title = html_escape(item["title"])
+        stamp = html_escape(format_pt_timestamp(item.get("updated_at"), "-"))
+        conversation_items.append(
+            f"<a class='ask-conversation-item{is_active}' href='/ask-wms?c={item['id']}'>"
+            f"{title}<span class='ask-conversation-meta'>{stamp}</span></a>"
+        )
+    if not conversation_items:
+        conversation_items.append("<div class='section-note'>No saved conversations yet.</div>")
 
     content = f"""
-    <section class='card'>
+    <div class='ask-page-header'>
         <div class='page-eyebrow'>&#9672; Ask WMS</div>
-        <h1>Operational Q&amp;A</h1>
-        <p class='section-note'>
-            Recruiter-friendly, rule-based answers for production, inventory, and quality questions in this isolated demo session.
-        </p>
+        <h1>Executive Command Assistant</h1>
+        <p class='section-note' style='margin:0;'>Exact answers from this private demo session. Conversations stay on the left.</p>
+    </div>
 
-        <div class='ops-summary-strip'>
-            <div class='ops-summary-tile'><div class='label'>Open Orders</div><div class='value'>{snapshot['orders_total'] - snapshot['completed']}</div></div>
-            <div class='ops-summary-tile'><div class='label'>Blocked</div><div class='value'>{snapshot['blocked']}</div></div>
-            <div class='ops-summary-tile'><div class='label'>Pending QA</div><div class='value'>{snapshot['pending_verification']}</div></div>
-            <div class='ops-summary-tile'><div class='label'>Quality Cases</div><div class='value'>{snapshot['open_quality_issues']}</div></div>
-            <div class='ops-summary-tile'><div class='label'>Active SKUs</div><div class='value'>{snapshot['sku_count']}</div></div>
-        </div>
+    <div class='ask-layout'>
+        <aside class='ask-sidebar'>
+            <h2 class='ask-sidebar-title'>Conversations</h2>
+            <form method='post' action='/ask-wms/new'>
+                <button class='ask-new-chat' type='submit'>New chat</button>
+            </form>
+            <div class='ask-conversation-list'>
+                {''.join(conversation_items)}
+            </div>
+        </aside>
 
-        <form method='post' style='display:grid;gap:12px;max-width:820px;'>
-            <label for='ask-question' style='font-weight:700;color:#344054;'>Your question</label>
-            <textarea id='ask-question' name='question' rows='3' placeholder='Example: Which orders are blocked by shortage?'>{question}</textarea>
-            <div><button type='submit'>Ask WMS</button></div>
-        </form>
-
-        <div class='ask-suggest'>{suggestion_html}</div>
-    </section>
-
-    <section class='card'>
-        <h2>Answer</h2>
-        <p style='font-size:16px;color:#0f172a;margin:0;'>{answer}</p>
-    </section>
+        <section class='ask-chat-shell'>
+            <div style='display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;'>
+                <div>
+                    <h2 style='margin:0;font-size:18px;'>{html_escape(active.get('title', 'Conversation'))}</h2>
+                </div>
+                <form method='post' action='/ask-wms/clear-chat' onsubmit="return confirm('Delete this conversation?');">
+                    <input type='hidden' name='conversation_id' value='{conversation_id}'>
+                    <button type='submit' class='action-btn secondary' style='width:auto;'>Delete chat</button>
+                </form>
+            </div>
+            <div class='ask-chat-log' id='ask-chat-log'>
+                {chat_transcript if chat_transcript else "<div class='ask-empty'>Start by asking a warehouse question.</div>"}
+            </div>
+            <form method='post' class='ask-composer'>
+                <input type='hidden' name='conversation_id' value='{conversation_id}'>
+                <label for='ask-question' style='font-weight:700;color:#344054;'>Ask the warehouse</label>
+                <textarea id='ask-question' name='question' placeholder='Example: How many SKUs are available?'></textarea>
+                <div class='ask-composer-actions'>
+                    <span class='section-note'>Misspellings are normalized automatically.</span>
+                    <button type='submit'>Ask WMS</button>
+                </div>
+            </form>
+            <div class='ask-suggest'>{chip_html}</div>
+            <div class='ask-suggest'>{suggestion_html}</div>
+        </section>
+    </div>
+    <script>
+    (function () {{
+        const log = document.getElementById('ask-chat-log');
+        if (log) {{
+            log.scrollTop = log.scrollHeight;
+        }}
+    }})();
+    </script>
     """
     return layout(content)
 

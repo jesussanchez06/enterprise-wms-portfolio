@@ -10,7 +10,7 @@ A warehouse management system prototype built with Python and Flask.
 - Operations Workboard
 - Quality Control
 - Supervisor Control Tower
-- Ask WMS (local rule-based operational Q&A)
+- Ask WMS (local operational intelligence assistant)
 - Isolated per-visitor demo sessions with Reset Demo
 - SLA Monitoring
 - Productivity and Inventory Analytics
@@ -22,6 +22,14 @@ A warehouse management system prototype built with Python and Flask.
 - SQLite
 - Pandas
 - Matplotlib
+
+## Ask WMS
+
+Ask WMS uses intent recognition, entity extraction, controlled database queries, and deterministic operational rules to provide natural-language warehouse decision support without requiring an external paid AI service.
+
+It can interpret multiple phrasings of the same operational question (for example “Top 3 actions?” and “What should we focus on?”), query the current visitor’s isolated demo data, summarize warehouse status, surface SLA/inventory/quality risks, and recommend priorities with explicit reasons.
+
+Ask WMS is read-only: natural-language questions cannot create orders, adjust inventory, pick, audit, ship, or reset data. Use the normal role workflows for changes.
 
 ## Purpose
 
