@@ -38,7 +38,10 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
     },
     "orders_open": {
         "concepts": ["orders"],
-        "phrases": ["open order", "how many open", "orders open", "pending order", "not completed"],
+        "phrases": [
+            "open order", "how many open", "order open", "order are open", "orders are open",
+            "pending order", "not completed", "how many order", "order currently open",
+        ],
         "weight": 5,
     },
     "orders_by_status": {
@@ -95,23 +98,43 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
         "phrases": [
             "most inventory", "highest stock", "top sku", "which part has the most",
             "which sku has the most", "largest inventory", "top part by quantity",
-            "top parts by quantity", "by quantity", "most stock",
+            "top parts by quantity", "by quantity", "most stock", "highest quantity",
         ],
         "weight": 8,
     },
     "least_inventory_qty": {
         "concepts": ["inventory"],
-        "phrases": ["least inventory", "lowest stock", "smallest inventory", "fewest units"],
+        "phrases": [
+            "least inventory", "lowest stock", "smallest inventory", "fewest units",
+            "which sku has the lowest", "which part has the lowest", "which has the lowest",
+            "which sku has the least", "which has the least", "the lowest", "the least",
+            "lowest inventory", "least stock", "lowest quantity", "least quantity",
+        ],
         "weight": 8,
     },
     "top_inventory_value": {
         "concepts": ["inventory"],
-        "phrases": ["top sku by value", "highest inventory value", "by inventory value"],
+        "phrases": [
+            "top sku by value", "highest inventory value", "by inventory value",
+            "worth the most", "worth most", "most valuable", "highest value",
+            "by value", "in terms of value", "inventory value ranking", "worth the most money",
+            "most money", "highest dollar", "by dollar", "by money",
+        ],
         "weight": 8,
     },
     "sku_inventory": {
         "concepts": ["inventory"],
         "phrases": ["how much sku", "parts left", "on hand for", "available for", "stock for"],
+        "weight": 8,
+        "requires": ["sku"],
+    },
+    "sku_open_orders": {
+        "concepts": ["orders", "inventory"],
+        "phrases": [
+            "open order using", "open order for", "order using", "order for sku",
+            "open demand for", "which order use", "order requesting", "order that use",
+            "using it", "for it",
+        ],
         "weight": 8,
         "requires": ["sku"],
     },
@@ -125,11 +148,20 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
         "phrases": ["inventory accuracy", "stock accuracy", "how accurate is inventory"],
         "weight": 7,
     },
+    "picker_count": {
+        "concepts": ["picking"],
+        "phrases": [
+            "how many picker", "active picker", "list picker", "picker roster",
+            "who are the picker", "configured picker", "picker do you have",
+            "pickers do you have", "number of picker", "how many active picker",
+        ],
+        "weight": 8,
+    },
     "picking_summary": {
         "concepts": ["picking", "capacity"],
         "phrases": [
-            "ready to pick", "picks in progress", "picker", "workboard", "picking productivity",
-            "who is picking", "backlog", "work queue",
+            "ready to pick", "picks in progress", "workboard", "picking productivity",
+            "who is picking", "backlog", "work queue", "picker workload", "picking backlog",
         ],
         "weight": 6,
     },
@@ -173,6 +205,28 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
     },
 }
 
+INVENTORY_RANKING_INTENTS = {
+    "top_inventory_qty",
+    "least_inventory_qty",
+    "top_inventory_value",
+    "inventory_summary",
+    "inventory_value",
+    "sku_count",
+    "low_stock",
+}
+
+
+def intent_family_for(intent: str | None) -> str | None:
+    if intent in INVENTORY_RANKING_INTENTS:
+        return "inventory_ranking"
+    if intent in {"picking_summary", "picker_count"}:
+        return "picking"
+    if intent in {"sla_summary", "sla_breached", "sla_at_risk"}:
+        return "sla"
+    if intent in {"orders_open", "orders_by_status", "critical_orders", "order_status", "shipping_today"}:
+        return "orders"
+    return None
+
 
 def classify_intent(question: str, warehouses: list[str] | None = None, prior_context: dict | None = None) -> dict[str, Any]:
     original = (question or "").strip()
@@ -197,17 +251,67 @@ def classify_intent(question: str, warehouses: list[str] | None = None, prior_co
 
     # Follow-up resolution
     prior = prior_context or {}
-    if prior.get("intent") and re.fullmatch(r"(which ones?|list them|show them|those|these)", normalized or ""):
+    prior_intent = prior.get("intent")
+    prior_family = prior.get("intent_family") or intent_family_for(prior_intent)
+
+    if prior_intent and re.fullmatch(r"(which ones?|list them|show them|those|these)", normalized or ""):
         return {
-            "intent": prior.get("intent"),
+            "intent": prior_intent,
             "confidence": "high",
             "score": 99,
             "entities": {**prior.get("entities", {}), **entities, "follow_up": True},
             "normalized": normalized,
             "concept_hits": hits,
+            "intent_family": intent_family_for(prior_intent),
         }
 
-    if prior.get("sku") and re.search(r"\b(open order|using it|for it|orders using)\b", normalized):
+    # Inventory ranking continuity: short reframes after a SKU/qty ranking turn.
+    if prior_family == "inventory_ranking" or prior_intent in INVENTORY_RANKING_INTENTS:
+        value_follow = bool(
+            re.search(r"\b(value|worth|money|dollar|dollars|valuable|priced?)\b", normalized)
+        )
+        least_follow = bool(
+            re.search(r"\b(lowest|least|fewest|smallest|minimum|bottom)\b", normalized)
+        )
+        most_follow = bool(
+            re.search(r"\b(most|highest|largest|greatest|top|biggest)\b", normalized)
+        )
+        short_follow = len(normalized.split()) <= 8
+        if value_follow and (short_follow or most_follow or "in terms" in normalized):
+            return {
+                "intent": "top_inventory_value",
+                "confidence": "high",
+                "score": 95,
+                "entities": {**prior.get("entities", {}), **entities, "follow_up": True, "limit": entities.get("limit") or 1},
+                "normalized": normalized,
+                "concept_hits": hits,
+                "intent_family": "inventory_ranking",
+            }
+        if least_follow and short_follow:
+            return {
+                "intent": "least_inventory_qty",
+                "confidence": "high",
+                "score": 94,
+                "entities": {**prior.get("entities", {}), **entities, "follow_up": True, "limit": entities.get("limit") or 1},
+                "normalized": normalized,
+                "concept_hits": hits,
+                "intent_family": "inventory_ranking",
+            }
+        if most_follow and short_follow and not value_follow:
+            return {
+                "intent": "top_inventory_qty",
+                "confidence": "high",
+                "score": 93,
+                "entities": {**prior.get("entities", {}), **entities, "follow_up": True, "limit": entities.get("limit") or 1},
+                "normalized": normalized,
+                "concept_hits": hits,
+                "intent_family": "inventory_ranking",
+            }
+
+    if prior.get("sku") and re.search(
+        r"\b(open order|using it|for it|order using|order for)\b",
+        normalized,
+    ):
         entities["sku"] = prior["sku"]
         return {
             "intent": "sku_open_orders",
@@ -216,6 +320,7 @@ def classify_intent(question: str, warehouses: list[str] | None = None, prior_co
             "entities": entities,
             "normalized": normalized,
             "concept_hits": hits,
+            "intent_family": intent_family_for("sku_open_orders"),
         }
 
     # Write attempts always win — Ask WMS is read-only.
@@ -234,6 +339,11 @@ def classify_intent(question: str, warehouses: list[str] | None = None, prior_co
         }
 
     # Boost combinations
+    if hits.get("orders") and re.search(
+        r"\b(how many order|order are open|order open|open order|pending order|not completed)\b",
+        normalized,
+    ) and not entities.get("sku"):
+        scores["orders_open"] += 8
     if hits.get("shipping") and (
         "today" in normalized
         or entities.get("date_label") == "today"
@@ -247,17 +357,41 @@ def classify_intent(question: str, warehouses: list[str] | None = None, prior_co
         scores["sla_breached"] += 8
     if hits.get("sla") and "risk" in normalized:
         scores["sla_at_risk"] += 8
-    if entities.get("sku") and hits.get("inventory"):
+    if entities.get("sku") and re.search(
+        r"\b(open order|order using|order for|order request|demand for|which order use)\b",
+        normalized,
+    ):
+        scores["sku_open_orders"] += 14
+    elif entities.get("sku") and hits.get("inventory"):
         scores["sku_inventory"] += 10
     if entities.get("order_id") and not hits.get("write_request"):
         scores["order_status"] += 12
-    if re.search(r"\b(top|most|highest|largest)\b", normalized) and hits.get("inventory"):
-        if "value" in normalized:
-            scores["top_inventory_value"] += 10
-        elif re.search(r"\b(least|lowest|fewest|smallest)\b", normalized):
-            scores["least_inventory_qty"] += 10
-        else:
-            scores["top_inventory_qty"] += 10
+
+    inventoryish = bool(hits.get("inventory")) or bool(
+        re.search(r"\b(sku|part|stock|inventory|units?)\b", normalized)
+    )
+    which_sku = bool(re.search(r"\b(which|what)\b", normalized)) and bool(
+        re.search(r"\b(sku|part|item|stock|inventory)\b", normalized)
+    )
+    valueish = bool(re.search(r"\b(value|worth|dollar|dollars|money|valuable|priced?)\b", normalized))
+    leastish = bool(re.search(r"\b(least|lowest|fewest|smallest|minimum|bottom)\b", normalized))
+    mostish = bool(re.search(r"\b(most|highest|largest|greatest|top|biggest)\b", normalized))
+    if inventoryish or which_sku:
+        if valueish and (mostish or which_sku or "in terms" in normalized):
+            scores["top_inventory_value"] += 14
+        elif leastish:
+            scores["least_inventory_qty"] += 14
+        elif mostish:
+            scores["top_inventory_qty"] += 12
+        elif which_sku and not valueish:
+            # "which sku has the ..." without an explicit polarity still leans quantity ranking.
+            scores["top_inventory_qty"] += 4
+
+    if hits.get("picking") and re.search(
+        r"\b(how many|list|active|roster|configured|do you have|available)\b",
+        normalized,
+    ) and re.search(r"\bpicker\b", normalized):
+        scores["picker_count"] += 12
 
     best_intent = max(scores, key=scores.get)
     best_score = scores[best_intent]
@@ -288,4 +422,5 @@ def classify_intent(question: str, warehouses: list[str] | None = None, prior_co
         "normalized": normalized,
         "concept_hits": hits,
         "scores": scores,
+        "intent_family": intent_family_for(intent),
     }

@@ -59,6 +59,7 @@ def answer_question(
     source_warehouse: str = "San Diego Warehouse 100",
     low_stock_threshold: int = 25,
     shortage_issue_type: str = "Inventory Shortage",
+    picker_roster: list[str] | None = None,
     now_pt: Callable,
     parse_order_datetime: Callable,
     normalize_urgency: Callable,
@@ -74,6 +75,7 @@ def answer_question(
     now = now_pt()
     footer = "Based on current WMS operational data."
     rec_footer = "Recommendation based on SLA status, inventory availability, workflow stage, and quality exceptions."
+    roster = [str(name).strip() for name in (picker_roster or []) if str(name).strip()]
 
     status_map = queries.count_orders_by_status(conn)
     inv = queries.inventory_snapshot(conn)
@@ -114,6 +116,7 @@ def answer_question(
 
     context = {
         "intent": intent,
+        "intent_family": classification.get("intent_family") or intents.intent_family_for(intent),
         "entities": entities,
         "sku": entities.get("sku"),
         "order_id": entities.get("order_id"),
@@ -482,18 +485,49 @@ def answer_question(
         )
         return answer, snapshot, context
 
+    if intent == "picker_count":
+        pickers = queries.picker_workload(conn)
+        workload = {p["picker"]: p["picks"] for p in pickers}
+        if roster:
+            bullets = [
+                f"{name}"
+                + (f" - {workload[name]} pick event(s)" if name in workload else " - no pick events yet")
+                for name in roster
+            ]
+            answer = compose_response(
+                f"This demo has {len(roster)} configured picker(s) on the operations roster.",
+                bullets,
+                "Ask about picking backlog or recommended actions for the next picker.",
+                footer,
+            )
+        else:
+            answer = compose_response(
+                "No picker roster is configured in this session.",
+                [f"{p['picker']}: {p['picks']} pick event(s)" for p in pickers]
+                or ["No pick transactions recorded yet."],
+                "Ask about picking backlog or ready-to-pick orders.",
+                footer,
+            )
+        return answer, snapshot, context
+
     if intent == "picking_summary":
         pickers = queries.picker_workload(conn)
+        bullets = [f"{p['picker']}: {p['picks']} pick event(s)" for p in pickers]
+        if not bullets and roster:
+            bullets = [
+                f"Configured roster ({len(roster)}): " + ", ".join(roster[:6])
+                + ("…" if len(roster) > 6 else ""),
+                "No pick transactions recorded yet in this demo session.",
+            ]
+        elif not bullets:
+            bullets = ["No pick transactions recorded yet in this demo session."]
         answer = compose_response(
             (
                 f"Operations queue: {snapshot['orders_placed']} ready/placed, "
                 f"{snapshot['picking']} picking in progress, {snapshot['blocked']} blocked."
             ),
-            (
-                [f"{p['picker']}: {p['picks']} pick event(s)" for p in pickers]
-                or ["No pick transactions recorded yet in this demo session."]
-            ),
-            "Ask what the next picker should work on via recommended actions.",
+            bullets,
+            "Ask how many pickers are configured, or what the next picker should work on.",
             footer,
         )
         return answer, snapshot, context
@@ -558,7 +592,7 @@ def answer_question(
         normalized = classification.get("normalized") or ""
         if "workflow" in normalized or "planner to shipping" in normalized:
             answer = compose_response(
-                "Orders move Planner → Operations pick → Quality verification → Completed/shipped, with Supervisor handling escalations.",
+                "Orders move Planner -> Operations pick -> Quality verification -> Completed/shipped, with Supervisor handling escalations.",
                 [
                     "Planner creates demand against source-warehouse inventory.",
                     "Operations picks and can block on shortage.",

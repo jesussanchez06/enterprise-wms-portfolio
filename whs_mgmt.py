@@ -211,7 +211,7 @@ def prepare_runtime_port(host, preferred_port, script_path):
     terminated_pids = terminate_other_wms_processes(script_path)
     if terminated_pids:
         print(
-            "Stopped stale Enterprise WMS process(es): "
+            "Stopped stale DigiTech WMS process(es): "
             + ", ".join(str(pid) for pid in terminated_pids)
         )
         deadline = time.time() + 3
@@ -4988,7 +4988,7 @@ def layout(content, body_class=""):
     </head>
     <body class="__BODY_CLASS__">
     <div class="nav">
-        <span class="nav-brand">Enterprise WMS</span>
+        <span class="nav-brand">DigiTech WMS</span>
         <div class="nav-links">
             <a href="/executive">Warehouse Executive Dashboard</a>
             <a href="/planner">Planner</a>
@@ -5522,6 +5522,7 @@ def answer_ask_wms(conn, question, prior_context=None, debug=False):
         source_warehouse=SOURCE_WAREHOUSE,
         low_stock_threshold=DEFAULT_LOW_STOCK_ALERT_THRESHOLD,
         shortage_issue_type=SHORTAGE_ISSUE_TYPE,
+        picker_roster=list(PICKER_ROSTER),
         now_pt=now_pt,
         parse_order_datetime=parse_order_datetime,
         normalize_urgency=normalize_urgency,
@@ -6175,6 +6176,7 @@ def ask_wms():
         )
         session["ask_wms_context"] = {
             "intent": context.get("intent"),
+            "intent_family": context.get("intent_family"),
             "entities": context.get("entities") or {},
             "sku": context.get("sku"),
             "order_id": context.get("order_id"),
@@ -6182,6 +6184,7 @@ def ask_wms():
         }
         meta = {
             "intent": context.get("intent"),
+            "intent_family": context.get("intent_family"),
             "entities": context.get("entities") or {},
         }
         # Rename untitled chats from the first user question.
@@ -6190,11 +6193,11 @@ def ask_wms():
         save_ask_wms_message(conn, conversation_id, "user", question, {"source": "ask-wms"})
         save_ask_wms_message(conn, conversation_id, "assistant", answer_html, meta)
         conn.commit()
-        conversations = list_ask_wms_conversations(conn)
-        active = get_ask_wms_conversation(conn, conversation_id)
-    else:
-        snapshot = build_ops_snapshot(conn)
+        conn.close()
+        # PRG + fragment keeps the viewport on the latest message after submit.
+        return redirect(f"/ask-wms?c={conversation_id}#ask-bottom")
 
+    snapshot = build_ops_snapshot(conn)
     chat_rows = list_ask_wms_chat(conn, conversation_id)
     conn.close()
 
@@ -6310,8 +6313,9 @@ def ask_wms():
             </div>
             <div class='ask-chat-log' id='ask-chat-log'>
                 {chat_transcript if chat_transcript else "<div class='ask-empty'>Start by asking a warehouse question.</div>"}
+                <div id='ask-bottom' tabindex='-1'></div>
             </div>
-            <form method='post' class='ask-composer'>
+            <form method='post' class='ask-composer' id='ask-composer'>
                 <input type='hidden' name='conversation_id' value='{conversation_id}'>
                 <label for='ask-question' style='font-weight:700;color:#344054;'>Ask the warehouse</label>
                 <textarea id='ask-question' name='question' placeholder='Example: How many SKUs are available?'></textarea>
@@ -6326,9 +6330,32 @@ def ask_wms():
     </div>
     <script>
     (function () {{
-        const log = document.getElementById('ask-chat-log');
-        if (log) {{
-            log.scrollTop = log.scrollHeight;
+        function scrollAskToLatest() {{
+            const bottom = document.getElementById('ask-bottom');
+            const log = document.getElementById('ask-chat-log');
+            const composer = document.getElementById('ask-composer');
+            if (log) {{
+                log.scrollTop = log.scrollHeight;
+                const bubbles = log.querySelectorAll('.ask-bubble');
+                if (bubbles.length) {{
+                    bubbles[bubbles.length - 1].scrollIntoView({{ behavior: 'auto', block: 'nearest' }});
+                }}
+            }}
+            if (bottom) {{
+                bottom.scrollIntoView({{ behavior: 'auto', block: 'end' }});
+            }} else if (composer) {{
+                composer.scrollIntoView({{ behavior: 'auto', block: 'nearest' }});
+            }}
+        }}
+        if (document.readyState === 'loading') {{
+            document.addEventListener('DOMContentLoaded', scrollAskToLatest);
+        }} else {{
+            scrollAskToLatest();
+        }}
+        window.addEventListener('load', scrollAskToLatest);
+        if (window.location.hash === '#ask-bottom') {{
+            window.setTimeout(scrollAskToLatest, 0);
+            window.setTimeout(scrollAskToLatest, 50);
         }}
     }})();
     </script>
@@ -12050,7 +12077,7 @@ if __name__ == "__main__":
     host, port, debug = get_runtime_config(default_port=5000)
     selected_port = prepare_runtime_port(host, port, __file__)
     if selected_port != port:
-        print(f"Port {port} is busy. Starting Enterprise WMS on port {selected_port} instead.")
+        print(f"Port {port} is busy. Starting DigiTech WMS on port {selected_port} instead.")
 
     print("Visitor demos use isolated SQLite files under demo_sessions/ cloned from the master seed.")
     app.run(host=host, port=selected_port, debug=debug, use_reloader=False)

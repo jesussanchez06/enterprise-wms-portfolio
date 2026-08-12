@@ -18,6 +18,7 @@ CONCEPTS: dict[str, set[str]] = {
     "inventory": {
         "inventory", "stock", "units available", "available quantity", "on hand", "onhand",
         "stock level", "material", "sku", "skus", "part", "parts", "part number",
+        "worth", "value", "valuable", "dollar", "dollars", "money",
     },
     "quality": {
         "quality", "qc", "audit", "audits", "inspection", "verification", "discrepancy",
