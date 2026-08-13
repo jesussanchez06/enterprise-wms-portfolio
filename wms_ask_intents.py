@@ -88,7 +88,8 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
         "phrases": [
             "shipping summary", "ready to ship", "pending ship", "awaiting ship",
             "shipping queue", "outbound summary", "what is ready to ship", "ship pending",
-            "orders ready for shipping", "shipping status",
+            "orders ready for shipping", "shipping status", "shipping performance",
+            "shipping volume", "shipping sla", "shipping trend", "late shipment",
         ],
         "weight": 6,
     },
@@ -266,7 +267,8 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
         "concepts": ["inventory"],
         "phrases": [
             "low stock", "running low", "out of stock", "need restock", "skus need attention",
-            "stockout", "zero stock", "below threshold",
+            "stockout", "zero stock", "below threshold", "overstock", "over stock",
+            "inventory warning", "stock warning", "units on hand",
         ],
         "weight": 7,
     },
@@ -384,8 +386,8 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
     "kpi_attention": {
         "concepts": ["executive", "priority"],
         "phrases": [
-            "which kpi needs attention", "kpi needs attention", "which kpi", "kpi attention",
-            "what kpi is off", "kpi below", "needs attention", "which metric needs",
+            "which kpi needs attention", "kpi needs attention", "which kpi is off",
+            "kpi attention", "what kpi is off", "which metric needs", "kpi below target",
         ],
         "weight": 8,
     },
@@ -393,7 +395,7 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
         "concepts": ["ai_analysis", "executive", "priority"],
         "phrases": [
             "focus today", "what should i focus", "summarize performance", "biggest risk",
-            "kpis below target", "top 3 actions", "top three actions", "vs yesterday",
+            "kpis below target", "vs yesterday",
             "versus yesterday", "compared to yesterday", "30 minute review", "thirty minute",
             "review first", "inventory attention", "warehouse attention", "why productivity",
             "ai analysis", "first look",
@@ -998,17 +1000,17 @@ def classify_intent(question: str, warehouses: list[str] | None = None, prior_co
         scores["context_shipped"] += 18
         scores["shipping_today"] -= 10
 
-    if re.search(r"\b(which kpi|kpi needs attention|needs attention)\b", normalized):
+    if re.search(r"\b(which kpi|kpi needs attention|kpi attention|metric needs)\b", normalized):
         scores["kpi_attention"] += 16
-        scores["recommended_actions"] += 4
+        scores["recommended_actions"] -= 4
     if hits.get("ai_analysis") or re.search(
         r"\b(focus today|summarize performance|biggest risk|vs yesterday|30 minute|thirty minute|"
-        r"top 3 actions|top three actions|below target|first look)\b",
+        r"below target|first look|ai analysis|review first)\b",
         normalized,
     ):
         scores["ai_briefing"] += 16
-        if re.search(r"\btop\s+(3|three)\s+actions?\b", normalized):
-            scores["recommended_actions"] += 8
+        if re.search(r"\btop\s+(3|three)\s+actions?\b", normalized) and "recommend" not in normalized:
+            scores["ai_briefing"] += 4
     if re.search(r"\b(average|avg|mean)\b", normalized) and re.search(
         r"\b(completion|cycle)\s+time\b", normalized
     ):
