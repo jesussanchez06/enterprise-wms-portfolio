@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from html import escape as html_escape
+from datetime import timedelta
 from typing import Any, Callable
 
 import wms_ask_intents as intents
@@ -476,6 +477,12 @@ def answer_question(
                 sla_note = f"SLA: {sla_label} ({sla_key})"
             except Exception:
                 sla_note = "SLA: unable to evaluate from order date"
+        picker_info = queries.get_order_picker(conn, detail["order_number"])
+        picker_line = (
+            f"Picker: {picker_info['picker']}"
+            if picker_info.get("picker")
+            else "Picker: not tracked on this order"
+        )
         answer = compose_response(
             (
                 f"Order {detail['order_number']} is {detail['status']} "
@@ -485,6 +492,7 @@ def answer_question(
                 f"Created: {detail['date']}",
                 f"Route: {detail['source']} → {detail['destination']}",
                 f"Picked {detail['picked_quantity']} of {detail['expected_quantity']} expected units",
+                picker_line,
                 sla_note,
                 *([f"Lines: {', '.join(lines)}"] if lines else []),
             ],
@@ -492,6 +500,11 @@ def answer_question(
             footer,
         )
         context["order_id"] = detail["order_number"]
+        if detail["lines"]:
+            context["sku"] = detail["lines"][0]["sku"]
+        if picker_info.get("picker"):
+            context["picker"] = picker_info["picker"]
+        _attach_quality_context(detail["order_number"])
         return answer, snapshot, context
 
     if intent == "sla_summary":
@@ -805,7 +818,14 @@ def answer_question(
 
     if intent == "picking_summary":
         pickers = queries.picker_workload(conn)
+        active = queries.active_pickers_now(conn)
         bullets = [f"{p['picker']}: {p['picks']} pick event(s)" for p in pickers]
+        if active:
+            bullets.insert(
+                0,
+                "Active pickers now: "
+                + ", ".join(f"{a['picker']} ({a['orders']} order(s))" for a in active),
+            )
         if not bullets and roster:
             bullets = [
                 f"Configured roster ({len(roster)}): " + ", ".join(roster[:6])
@@ -814,6 +834,10 @@ def answer_question(
             ]
         elif not bullets:
             bullets = ["No pick transactions recorded yet in this demo session."]
+        bullets.append(
+            f"Waiting verification: {snapshot['pending_verification']} | "
+            f"Blocked shortages: {snapshot['blocked']}"
+        )
         answer = compose_response(
             (
                 f"Operations queue: {snapshot['orders_placed']} ready/placed, "
@@ -828,9 +852,7 @@ def answer_question(
     if intent == "productivity_limits":
         pickers = queries.picker_workload(conn)
         shipped_today, _ = queries.count_shipped_on_date(conn, now.date())
-        from datetime import timedelta as _td
-
-        shipped_yesterday, _ = queries.count_shipped_on_date(conn, now.date() - _td(days=1))
+        shipped_yesterday, _ = queries.count_shipped_on_date(conn, now.date() - timedelta(days=1))
         mix = queries.planner_mix(conn)
         bullets = [
             "Units/hour and picks/hour are not fully supported — no shift-level time-on-task clock.",
@@ -1186,12 +1208,10 @@ def answer_question(
 
     if intent == "ai_briefing":
         normalized = classification.get("normalized") or ""
-        from datetime import timedelta as _td
-
         shipped_today, _ = queries.count_shipped_on_date(conn, now.date())
-        shipped_yesterday, _ = queries.count_shipped_on_date(conn, now.date() - _td(days=1))
+        shipped_yesterday, _ = queries.count_shipped_on_date(conn, now.date() - timedelta(days=1))
         created_today = queries.count_orders_created_on_date(conn, now.date())
-        created_yesterday = queries.count_orders_created_on_date(conn, now.date() - _td(days=1))
+        created_yesterday = queries.count_orders_created_on_date(conn, now.date() - timedelta(days=1))
         actions = recommendations.build_recommendations(
             conn,
             limit=3,

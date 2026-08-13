@@ -413,7 +413,7 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
         "concepts": ["orders", "urgent", "critical", "blocked"],
         "phrases": [
             "urgent order", "count urgent", "how many urgent", "urgent critical blocked",
-            "urgency mix", "blocked waiting inventory", "missed sla", "longest order",
+            "blocked waiting inventory", "missed sla", "longest order",
             "fastest order", "completed today list", "list completed today",
         ],
         "weight": 6,

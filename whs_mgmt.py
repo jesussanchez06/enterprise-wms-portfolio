@@ -6618,6 +6618,7 @@ def ask_wms():
             "sku": context.get("sku"),
             "order_id": context.get("order_id"),
             "urgency": context.get("urgency"),
+            "picker": context.get("picker"),
         }
         meta = {
             "intent": context.get("intent"),
