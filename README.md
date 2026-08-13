@@ -1,16 +1,16 @@
 # DigiTech WMS
 
-A warehouse management system prototype built with Python and Flask.
+A warehouse management system prototype built with Python and Flask — designed as a LinkedIn / recruiter demo with live Executive Dashboard KPIs and Ask WMS operational Q&A.
 
 ## Features
 
-- Warehouse Executive Dashboard
+- Warehouse Executive Dashboard (real KPIs from SQLite records)
 - Order Planning (blocks over-ordering against available inventory)
 - Inventory Management
 - Operations Workboard
 - Quality Control
 - Supervisor Control Tower
-- Ask WMS (local operational intelligence assistant)
+- Ask WMS (local operational intelligence assistant — no paid LLM APIs)
 - Isolated per-visitor demo sessions with Reset Demo
 - SLA Monitoring
 - Productivity and Inventory Analytics
@@ -18,10 +18,35 @@ A warehouse management system prototype built with Python and Flask.
 ## Technologies
 
 - Python
-- Flask
+- Flask + Gunicorn
 - SQLite
 - Pandas
 - Matplotlib
+
+## Recruiter demo baseline (82 completed orders)
+
+Every visitor starts from a shared master seed (`enterprise_wms_master.db`) with:
+
+| KPI | Baseline |
+| --- | --- |
+| All-time orders | **82** |
+| Orders Pending | **0** (all Completed / shipped) |
+| Quality Audit Pass Rate | **>98%** (derived from `quality_audits`) |
+| Open quality / shortage issues | **0** (historical exceptions are Resolved) |
+
+KPIs are never hard-coded in the UI — they are calculated from order, audit, inventory, and transaction rows.
+
+### Persistence model
+
+1. **Master template** — `enterprise_wms_master.db` holds the completed 82-order baseline.
+2. **Visitor isolation** — each browser gets a private clone under `demo_sessions/<session>.db`.
+3. **Reset Demo** — reclones the same 82-order / 0-pending master (never an empty warehouse).
+4. **Cold start / Render** — if the master DB is missing or off-baseline (common on free-tier ephemeral disk), `bootstrap_application()` rebuilds the full completed baseline automatically on process start or first request.
+5. **Startup never wipes a healthy baseline** — reseeding only runs when the tagged 82-order completed set is absent.
+
+### Render disk caveat
+
+On Render’s free tier, the filesystem is ephemeral. After a deploy or idle spin-down the SQLite files may disappear. DigiTech WMS treats that as a cold start and **re-seeds the 82-order completed baseline** so recruiters still see live KPIs. For longer-lived state, attach a persistent disk or external DB later; the demo does not require it.
 
 ## Ask WMS
 
@@ -52,11 +77,44 @@ Ask WMS is read-only: natural-language questions cannot create orders, adjust in
 - Planner destination / urgency mix
 - Help / workflow explanations
 
-### Local demo
+## Local demo
 
-Run `python whs_mgmt.py`, then open `http://127.0.0.1:5000/ask-wms`.
+```bash
+pip install -r requirements.txt
+python whs_mgmt.py
+```
 
-Phrase-variation intent tests: `python tests/test_ask_wms_intents.py`.
+Open:
+
+- Executive Dashboard: `http://127.0.0.1:5000/executive`
+- Ask WMS: `http://127.0.0.1:5000/ask-wms`
+
+Phrase-variation intent tests:
+
+```bash
+python tests/test_ask_wms_intents.py
+```
+
+## Deploy (Render)
+
+This branch includes:
+
+- `Procfile` — gunicorn binding to `$PORT`
+- `render.yaml` — Blueprint-style web service
+- `runtime.txt` — Python 3.12
+- `requirements.txt` — Flask, gunicorn, pandas, matplotlib, Werkzeug
+
+### Steps
+
+1. Push `wms-ai-upgrade` (or merge to the branch Render deploys from).
+2. In Render: **New → Blueprint** (uses `render.yaml`) or **Web Service** with:
+   - Build: `pip install -r requirements.txt`
+   - Start: `gunicorn whs_mgmt:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120`
+3. Set `WMS_SECRET_KEY` (auto-generated via Blueprint) and `FLASK_DEBUG=0`.
+4. After deploy, open `/executive` — expect **Orders Pending = 0**, **All-time = 82**, quality **>98%**.
+5. Use **Reset Demo** anytime to restore the same baseline in your browser session.
+
+Local PORT binding: `whs_mgmt.py` reads `PORT` / `HOST` via `get_runtime_config()` (default `5000` / `0.0.0.0`).
 
 ## Purpose
 

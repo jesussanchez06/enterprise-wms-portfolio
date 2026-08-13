@@ -412,3 +412,247 @@ def build_sla_buckets(
         "at_risk_count": len(buckets.get("at_risk", [])),
         "breached_count": len(buckets.get("breached", [])),
     }
+
+
+def list_oldest_open_orders(conn, limit: int = 8) -> list[dict[str, Any]]:
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT order_number, urgency, status, date
+        FROM order_header
+        WHERE status != 'Completed'
+        ORDER BY date ASC
+        LIMIT ?
+        """,
+        (max(1, min(int(limit or 8), 20)),),
+    )
+    return [
+        {
+            "order_number": row[0],
+            "urgency": row[1],
+            "status": row[2],
+            "date": row[3],
+        }
+        for row in c.fetchall()
+    ]
+
+
+def inventory_adjustments(conn, limit: int = 10, sku: str | None = None) -> list[dict[str, Any]]:
+    c = conn.cursor()
+    if sku:
+        c.execute(
+            """
+            SELECT tx_time, sku, warehouse, location, qty_change, notes
+            FROM inventory_transactions
+            WHERE tx_code = 'ADJUST' AND sku = ?
+            ORDER BY tx_time DESC
+            LIMIT ?
+            """,
+            (sku, max(1, min(int(limit or 10), 25))),
+        )
+    else:
+        c.execute(
+            """
+            SELECT tx_time, sku, warehouse, location, qty_change, notes
+            FROM inventory_transactions
+            WHERE tx_code = 'ADJUST'
+            ORDER BY tx_time DESC
+            LIMIT ?
+            """,
+            (max(1, min(int(limit or 10), 25)),),
+        )
+    return [
+        {
+            "tx_time": row[0],
+            "sku": row[1],
+            "warehouse": row[2],
+            "location": row[3],
+            "qty_change": int(row[4] or 0),
+            "notes": row[5],
+        }
+        for row in c.fetchall()
+    ]
+
+
+def _order_completion_time(conn, order_number: str) -> str | None:
+    """Best-effort completion timestamp for OTIF (audit pass, else pick close/pick)."""
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT audit_time
+        FROM quality_audits
+        WHERE order_number = ?
+          AND result IN ('Pass', 'Passed')
+        ORDER BY audit_time DESC
+        LIMIT 1
+        """,
+        (order_number,),
+    )
+    row = c.fetchone()
+    if row and row[0]:
+        return str(row[0])
+    c.execute(
+        """
+        SELECT tx_time
+        FROM inventory_transactions
+        WHERE order_number = ?
+          AND tx_code IN ('PICK_CLOSE', 'PICK')
+        ORDER BY
+            CASE tx_code WHEN 'PICK_CLOSE' THEN 0 ELSE 1 END,
+            tx_time DESC
+        LIMIT 1
+        """,
+        (order_number,),
+    )
+    row = c.fetchone()
+    if row and row[0]:
+        return str(row[0])
+    return None
+
+
+def otif_snapshot(
+    conn,
+    *,
+    parse_order_datetime: Callable,
+    normalize_urgency: Callable,
+    calculate_sla_deadline: Callable,
+) -> dict[str, Any]:
+    """
+    Honest OTIF for Completed orders when completion time is recoverable.
+
+    On-time: completion_time <= SLA deadline from order create date + urgency.
+    In-full: picked_quantity >= expected_quantity (when expected_quantity > 0).
+    """
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT order_number, urgency, date, expected_quantity, picked_quantity
+        FROM order_header
+        WHERE status = 'Completed'
+        """
+    )
+    rows = c.fetchall()
+    total = len(rows)
+    measured = 0
+    otif_count = 0
+    on_time_count = 0
+    in_full_count = 0
+    missing_completion = 0
+    samples: list[dict[str, Any]] = []
+
+    for order_number, urgency, date_str, expected_qty, picked_qty in rows:
+        expected = int(expected_qty or 0)
+        picked = int(picked_qty or 0)
+        in_full = (expected <= 0) or (picked >= expected)
+        completion_raw = _order_completion_time(conn, str(order_number))
+        if not completion_raw:
+            missing_completion += 1
+            continue
+        try:
+            order_time = parse_order_datetime(date_str)
+            completion_time = parse_order_datetime(completion_raw)
+            deadline = calculate_sla_deadline(order_time, normalize_urgency(urgency, "Standard"))
+            on_time = completion_time <= deadline
+        except Exception:
+            missing_completion += 1
+            continue
+        measured += 1
+        if on_time:
+            on_time_count += 1
+        if in_full:
+            in_full_count += 1
+        is_otif = on_time and in_full
+        if is_otif:
+            otif_count += 1
+        if len(samples) < 6 and not is_otif:
+            samples.append(
+                {
+                    "order_number": order_number,
+                    "on_time": on_time,
+                    "in_full": in_full,
+                    "urgency": urgency,
+                }
+            )
+
+    otif_pct = round((otif_count / measured) * 100, 1) if measured else None
+    return {
+        "completed_total": total,
+        "measured": measured,
+        "missing_completion": missing_completion,
+        "otif_count": otif_count,
+        "otif_pct": otif_pct,
+        "on_time_count": on_time_count,
+        "in_full_count": in_full_count,
+        "samples_missed": samples,
+        "supported": measured > 0,
+        "definition": (
+            "OTIF = Completed orders that finished on/before SLA deadline "
+            "and picked_quantity >= expected_quantity."
+        ),
+    }
+
+
+def cross_ops_signals(conn, sla_buckets: dict[str, Any]) -> dict[str, Any]:
+    """Deterministic cross-functional risk signals from live queues."""
+    status_map = count_orders_by_status(conn)
+    blocked = int(status_map.get("Blocked", 0) or 0)
+    pending_qa = int(status_map.get("Pending Verification", 0) or 0)
+    quality_issue = int(status_map.get("Quality Issue", 0) or 0)
+    low = low_stock_skus(conn, threshold=25, limit=5)
+    breached = sla_buckets.get("breached") or []
+    at_risk = sla_buckets.get("at_risk") or []
+    shortage_linked = [
+        r for r in breached + at_risk if str(r.get("status")) in {"Blocked", "Orders Placed"}
+    ]
+    quality_linked = [
+        r
+        for r in breached + at_risk
+        if str(r.get("status")) in {"Pending Verification", "Quality Issue"}
+    ]
+    signals = []
+    if blocked:
+        signals.append(f"{blocked} blocked order(s) — inventory shortage is stalling fulfillment.")
+    if pending_qa or quality_issue:
+        signals.append(
+            f"{pending_qa + quality_issue} order(s) waiting on quality — shipping cannot close."
+        )
+    if shortage_linked:
+        signals.append(
+            f"{len(shortage_linked)} SLA-risk/breached order(s) sit in blocked/placed stages "
+            "(inventory↔SLA pressure)."
+        )
+    if quality_linked:
+        signals.append(
+            f"{len(quality_linked)} SLA-risk/breached order(s) sit in QA/quality-issue stages "
+            "(quality↔shipping pressure)."
+        )
+    if low:
+        signals.append(f"{len(low)} low-stock SKU(s) may create future blocks.")
+    bottleneck = "None clear"
+    if blocked >= max(pending_qa, 1) and blocked > 0:
+        bottleneck = "Inventory shortages / blocked orders"
+    elif (pending_qa + quality_issue) > blocked:
+        bottleneck = "Quality verification queue"
+    elif len(breached) + len(at_risk) > 0:
+        bottleneck = "SLA pressure on open work"
+    elif int(status_map.get("Orders Placed", 0) or 0) > int(status_map.get("Picking in Progress", 0) or 0):
+        bottleneck = "Picking release / ready-to-pick queue"
+    return {
+        "signals": signals,
+        "bottleneck": bottleneck,
+        "blocked": blocked,
+        "pending_qa": pending_qa,
+        "quality_issue": quality_issue,
+        "sla_pressure": len(breached) + len(at_risk),
+    }
+
+
+def sla_breach_cause_hint(status: str) -> str:
+    mapping = {
+        "Blocked": "Likely inventory shortage / blocked workflow",
+        "Pending Verification": "Waiting on quality verification",
+        "Quality Issue": "Open quality escalation",
+        "Orders Placed": "Not yet released/picked",
+        "Picking in Progress": "Pick still in progress",
+    }
+    return mapping.get(str(status or ""), "Cause not fully attributable from available fields")

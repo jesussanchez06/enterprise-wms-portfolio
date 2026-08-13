@@ -49,6 +49,69 @@ def migrate_legacy_db_to_master():
     return False
 
 
+def _remove_sqlite_file(path):
+    """Delete a SQLite DB and its WAL/SHM sidecars if present."""
+    removed = 0
+    for candidate in (path, f"{path}-wal", f"{path}-shm"):
+        if os.path.exists(candidate):
+            try:
+                os.remove(candidate)
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+def purge_demo_session_databases():
+    """Delete every visitor clone so the next request reclones from master."""
+    ensure_session_db_dir()
+    removed = 0
+    for name in os.listdir(SESSION_DB_DIR):
+        if not (name.endswith(".db") or name.endswith(".db-wal") or name.endswith(".db-shm")):
+            continue
+        path = os.path.join(SESSION_DB_DIR, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            os.remove(path)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def sqlite_order_count(db_path):
+    if not db_path or not os.path.exists(db_path):
+        return 0
+    try:
+        conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+        try:
+            row = conn.execute("SELECT COUNT(*) FROM order_header").fetchone()
+            return int(row[0] or 0) if row else 0
+        except Exception:
+            return 0
+        finally:
+            conn.close()
+    except Exception:
+        return 0
+
+
+def db_has_demo_baseline(db_path):
+    """True when the DB has the exact tagged 82-order recruiter baseline."""
+    if not db_path or not os.path.exists(db_path):
+        return False
+    try:
+        from wms_demo_seed import demo_baseline_present
+
+        conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+        try:
+            return bool(demo_baseline_present(conn))
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
+
 def get_demo_session_id():
     session_id = session.get("demo_session_id")
     if not session_id:
@@ -86,23 +149,34 @@ def clone_master_database(dest_path):
 
 
 def ensure_visitor_session_db(force_reset=False):
-    """Clone the shared master seed into an isolated per-visitor SQLite file."""
+    """Clone the shared master seed into an isolated per-visitor SQLite file.
+
+    Aggressively reclones when this browser still has a pre-82-order stale DB.
+    """
     path = session_db_path()
+    stale_session = False
+    if os.path.exists(path) and not force_reset:
+        # Cookie still points at an old clone (0–2 orders) while master has the
+        # recruiter baseline — heal automatically so the dashboard updates without
+        # requiring a manual Reset Demo hunt.
+        if db_has_demo_baseline(MASTER_DB) and not db_has_demo_baseline(path):
+            stale_session = True
+            force_reset = True
+
     if force_reset and os.path.exists(path):
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-        for suffix in ("-wal", "-shm"):
-            sidecar = path + suffix
-            if os.path.exists(sidecar):
-                try:
-                    os.remove(sidecar)
-                except OSError:
-                    pass
+        _remove_sqlite_file(path)
 
     if not os.path.exists(path):
+        if not db_has_demo_baseline(MASTER_DB):
+            # Last-resort heal: rebuild master before cloning into a visitor session.
+            ensure_bootstrap_demo_data(force_orders=True)
         clone_master_database(path)
+        if stale_session:
+            debug_log(
+                "system.reclone_stale_demo_session",
+                session_id=session.get("demo_session_id", ""),
+                orders=sqlite_order_count(path),
+            )
     return path
 
 
@@ -124,8 +198,16 @@ def get_conn(use_master=False):
 
 def reset_visitor_demo_data():
     """Restore this browser visitor to the original sample warehouse baseline."""
+    # Ensure shared master is the 82-order baseline before recloning.
+    ensure_bootstrap_demo_data(force_orders=False)
+    if not db_has_demo_baseline(MASTER_DB):
+        ensure_bootstrap_demo_data(force_orders=True)
     ensure_visitor_session_db(force_reset=True)
-    return {"reset": True, "session_id": session.get("demo_session_id", "")}
+    return {
+        "reset": True,
+        "session_id": session.get("demo_session_id", ""),
+        "orders": sqlite_order_count(session_db_path()),
+    }
 
 
 def get_runtime_config(default_port):
@@ -238,8 +320,12 @@ def find_available_port(host, preferred_port, max_attempts=20):
 
 
 def log_inventory_transaction(conn, tx_code, order_number, sku, warehouse, location,
-                              qty_change, qty_before, qty_after, user_role, notes=""):
+                              qty_change, qty_before, qty_after, user_role, notes="",
+                              tx_time=None):
     c = conn.cursor()
+    resolved_tx_time = tx_time.isoformat() if isinstance(tx_time, datetime) else (
+        clean_display_text(tx_time, "") or now_pt().isoformat()
+    )
     c.execute("""
         INSERT INTO inventory_transactions (
             tx_time,
@@ -256,7 +342,7 @@ def log_inventory_transaction(conn, tx_code, order_number, sku, warehouse, locat
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        now_pt().isoformat(),
+        resolved_tx_time,
         tx_code,
         order_number,
         sku,
@@ -2702,9 +2788,12 @@ def seed_demo_inventory(conn, sku_count=120):
 
         for wh_index, warehouse in enumerate(warehouses):
             location = f"{location_prefixes[wh_index % len(location_prefixes)]}{(index % 12) + 1:02d}"
+            # Base band ~40–219 (+20 at source). Multiply for planner ATP headroom
+            # so demo users can place larger multi-line orders without hard-stop shortages.
             quantity = 40 + ((index * 7 + wh_index * 11) % 180)
             if warehouse == SOURCE_WAREHOUSE:
                 quantity += 20
+            quantity *= 4
 
             c.execute(
                 "INSERT INTO inventory VALUES (?, ?, ?, ?, ?)",
@@ -2714,27 +2803,174 @@ def seed_demo_inventory(conn, sku_count=120):
 
     return seeded_rows
 
-def ensure_bootstrap_demo_data():
-    conn = get_conn()
+def _demo_seed_dependencies():
+    # Plain dict (not an instance) so callables are not turned into bound methods.
+    return {
+        "seed_demo_inventory": seed_demo_inventory,
+        "SOURCE_WAREHOUSE": SOURCE_WAREHOUSE,
+        "DESTINATION_WAREHOUSES": DESTINATION_WAREHOUSES,
+        "PICKER_ROSTER": PICKER_ROSTER,
+        "log_inventory_transaction": log_inventory_transaction,
+        "get_best_inventory_location": get_best_inventory_location,
+        "create_supervisor_issue": create_supervisor_issue,
+        "build_issue_type": build_issue_type,
+        "SHORTAGE_ISSUE_TYPE": SHORTAGE_ISSUE_TYPE,
+        "shortage_issue_audit_id": shortage_issue_audit_id,
+        "calculate_sla_deadline": calculate_sla_deadline,
+    }
+
+
+def ensure_bootstrap_demo_data(force_orders: bool = False, purge_sessions: bool = False):
+    """Ensure inventory + the exact 82-order completed recruiter baseline exist on master.
+
+    When the master baseline is rebuilt (or purge_sessions=True), wipe demo_sessions/
+    so every browser reclones the fresh 82-order / 0-pending template on the next request.
+    Safe to call on every cold start (local or Render): never wipes a healthy baseline.
+    """
+    from wms_demo_seed import ensure_demo_order_baseline, DEMO_ORDER_COUNT, demo_baseline_present
+
+    conn = get_conn(use_master=True)
     c = conn.cursor()
 
     c.execute("SELECT COUNT(*) FROM inventory")
     inventory_count = int(c.fetchone()[0] or 0)
     c.execute("SELECT COUNT(*) FROM order_header")
     order_count = int(c.fetchone()[0] or 0)
+    baseline_ok = demo_baseline_present(conn)
 
     result = {
         "seeded_inventory_rows": 0,
         "seeded_orders": 0,
         "seeded_quality_escalations": 0,
+        "baseline_orders": order_count,
+        "target_orders": DEMO_ORDER_COUNT,
+        "purged_session_files": 0,
+        "reseeded": False,
+        "baseline_ok": baseline_ok,
     }
 
-    if inventory_count == 0:
+    deps = _demo_seed_dependencies()
+    needs_order_seed = force_orders or (not baseline_ok) or order_count != DEMO_ORDER_COUNT
+
+    # Full baseline rebuild reseeds inventory. Only top-up when empty and not rebuilding.
+    if inventory_count == 0 and not needs_order_seed:
         result["seeded_inventory_rows"] = seed_demo_inventory(conn)
         conn.commit()
 
+    seed_summary = ensure_demo_order_baseline(
+        conn,
+        force=bool(needs_order_seed),
+        dependencies=deps,
+    )
+    result["seed_summary"] = seed_summary
+    if seed_summary.get("seeded"):
+        result["reseeded"] = True
+        result["seeded_orders"] = int(seed_summary.get("orders_created") or 0)
+        result["seeded_quality_escalations"] = int(seed_summary.get("quality_issues") or 0)
+        result["seeded_inventory_rows"] = int(
+            seed_summary.get("inventory_rows") or result["seeded_inventory_rows"]
+        )
+    result["baseline_orders"] = int(
+        seed_summary.get("total_orders")
+        or sqlite_order_count(MASTER_DB)
+        or DEMO_ORDER_COUNT
+    )
+    result["baseline_ok"] = demo_baseline_present(conn)
+
+    conn.commit()
     conn.close()
+
+    # Stale visitor clones keep showing old pending-heavy data even when master is correct.
+    if purge_sessions or result["reseeded"] or not baseline_ok:
+        result["purged_session_files"] = purge_demo_session_databases()
+
     return result
+
+
+_APP_BOOTSTRAPPED = False
+
+
+def bootstrap_application(force_orders: bool = False, purge_sessions: bool = False):
+    """Idempotent cold-start bootstrap for local `python whs_mgmt.py` and gunicorn/Render.
+
+    Rebuilds the 82-order completed master baseline only when missing/off-baseline
+    (e.g. ephemeral disk wiped on Render restart). Never clears a healthy baseline.
+    """
+    global _APP_BOOTSTRAPPED
+    from wms_demo_seed import DEMO_ORDER_COUNT as _DEMO_ORDER_COUNT
+
+    ensure_session_db_dir()
+    migrate_legacy_db_to_master()
+    init_db()
+
+    try:
+        load_inventory()
+    except Exception as exc:
+        print(f"Warning: could not load inventory spreadsheet: {exc}")
+
+    master_orders = sqlite_order_count(MASTER_DB)
+    master_ok = db_has_demo_baseline(MASTER_DB)
+    stale_sessions = 0
+    ensure_session_db_dir()
+    for name in os.listdir(SESSION_DB_DIR):
+        if not name.endswith(".db"):
+            continue
+        session_path = os.path.join(SESSION_DB_DIR, name)
+        if os.path.isfile(session_path) and not db_has_demo_baseline(session_path):
+            stale_sessions += 1
+
+    bootstrap_result = ensure_bootstrap_demo_data(
+        force_orders=force_orders or (not master_ok) or master_orders != _DEMO_ORDER_COUNT,
+        purge_sessions=purge_sessions or (stale_sessions > 0) or (not master_ok),
+    )
+
+    if bootstrap_result.get("seeded_inventory_rows"):
+        print(
+            f"Seeded {bootstrap_result['seeded_inventory_rows']} demo inventory row(s) "
+            "for the recruiter baseline."
+        )
+    if bootstrap_result.get("seeded_orders"):
+        print(
+            f"Seeded {bootstrap_result['seeded_orders']} completed demo order(s) "
+            f"(0 pending) with {bootstrap_result['seeded_quality_escalations']} "
+            "historical quality exception(s)."
+        )
+    if bootstrap_result.get("purged_session_files"):
+        print(
+            f"Purged {bootstrap_result['purged_session_files']} stale demo_sessions file(s) "
+            "so visitors reclone the 82-order / 0-pending master."
+        )
+    print(
+        f"Master demo baseline ready: {bootstrap_result.get('baseline_orders', 0)} order(s) "
+        f"(target {_DEMO_ORDER_COUNT}, pending=0)."
+    )
+
+    conn = get_conn(use_master=True)
+    normalized_rows = normalize_inventory_assignments(conn)
+    normalized_urgency_rows = normalize_urgency_labels(conn)
+    if normalized_rows:
+        conn.commit()
+        print(
+            f"Normalized {normalized_rows} inventory row(s) with default assignment "
+            f"{DEFAULT_INVENTORY_WAREHOUSE}/{DEFAULT_INVENTORY_LOCATION}."
+        )
+    if normalized_urgency_rows:
+        conn.commit()
+        print(f"Normalized {normalized_urgency_rows} order urgency value(s) to Standard/Urgent/Critical.")
+
+    # With a completed-only baseline this is a no-op; kept for safety if data drifts.
+    startup_blocked_orders = enforce_quality_gate_on_pending_orders(conn)
+    if startup_blocked_orders:
+        conn.commit()
+        print(
+            "Quality gate remediation moved "
+            f"{len(startup_blocked_orders)} order(s) from Pending Verification to Picking in Progress."
+        )
+    conn.close()
+
+    _APP_BOOTSTRAPPED = True
+    return bootstrap_result
+
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("WMS_SECRET_KEY", "enterprise-wms-linkedin-demo-secret")
@@ -2747,6 +2983,9 @@ def bind_isolated_demo_session():
     # Static assets are unused in this monolith; still skip non-HTML noise safely.
     if request.endpoint == "static":
         return None
+    # gunicorn/Render never hit __main__; bootstrap on first request if needed.
+    if not _APP_BOOTSTRAPPED:
+        bootstrap_application()
     ensure_visitor_session_db()
     return None
 
@@ -2754,7 +2993,8 @@ def bind_isolated_demo_session():
 # DATABASE INITIALIZATION
 # ======================================================
 def init_db():
-    conn = get_conn()
+    # Always initialize the shared master template (not a visitor clone).
+    conn = get_conn(use_master=True)
     c = conn.cursor()
 
 
@@ -3261,32 +3501,6 @@ def layout(content, body_class=""):
             .ask-layout {grid-template-columns: 1fr;}
             .ask-sidebar {max-height: 240px;}
             .ask-chat-shell, .ask-sidebar {min-height: 0;}
-        }
-        .ops-summary-strip {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-            gap: 12px;
-            margin: 16px 0 22px 0;
-        }
-        .ops-summary-tile {
-            background: #ffffff;
-            border: 1px solid #dbe4f0;
-            border-radius: 14px;
-            padding: 14px 16px;
-        }
-        .ops-summary-tile .label {
-            font-size: 11px;
-            font-weight: 700;
-            letter-spacing: 0.05em;
-            text-transform: uppercase;
-            color: #64748b;
-        }
-        .ops-summary-tile .value {
-            margin-top: 6px;
-            font-size: 24px;
-            font-weight: 800;
-            letter-spacing: -0.03em;
-            color: var(--ink-900);
         }
         .container {
             padding: 32px 40px 48px 40px;
@@ -5004,7 +5218,7 @@ def layout(content, body_class=""):
     </div>
 
     <div class="container">
-    <p class="demo-session-note">Private demo session &mdash; your warehouse actions stay in this browser only. Use Reset Demo anytime to restore the shared sample baseline.</p>
+    <p class="demo-session-note">Private demo session &mdash; your warehouse actions stay in this browser only. Use Reset Demo anytime to restore the shared 82-order completed baseline (0 pending).</p>
     """
     html += content
     html += """
@@ -5527,6 +5741,7 @@ def answer_ask_wms(conn, question, prior_context=None, debug=False):
         parse_order_datetime=parse_order_datetime,
         normalize_urgency=normalize_urgency,
         calculate_sla_status=calculate_sla_status,
+        calculate_sla_deadline=calculate_sla_deadline,
         sku_description=sku_semiconductor_description,
         debug=debug,
     )
@@ -5767,7 +5982,7 @@ def _answer_ask_wms_legacy(conn, question):
             [
                 f"Pipeline: {snapshot['orders_placed']} placed, {snapshot['picking']} picking, {snapshot['pending_verification']} pending verification.",
                 f"SLA risk on open work: {snapshot['sla_healthy']} healthy, {snapshot['sla_at_risk']} at risk, {snapshot['sla_breached']} breached.",
-                f"Quality: {snapshot['open_quality_issues']} open quality case(s); pick audit accuracy {pick_accuracy}% ({snapshot['audits_passed']}/{snapshot['audits_total']}).",
+                f"Quality: {snapshot['open_quality_issues']} open quality case(s); quality audit pass rate {pick_accuracy}% ({snapshot['audits_passed']}/{snapshot['audits_total']}).",
                 f"Inventory: {snapshot['sku_count']} active SKUs / {snapshot['units_on_hand']:,} units on hand.",
             ],
             "Ask which orders are blocked or which SKUs are low stock.",
@@ -5813,7 +6028,7 @@ def _answer_ask_wms_legacy(conn, question):
             return compose_ask_response(
                 "0 orders are pending quality verification right now.",
                 [f"Open quality cases in Supervisor: {snapshot['open_quality_issues']}"],
-                "Ask for pick accuracy or failed audits.",
+                "Ask for quality audit pass rate or failed audits.",
             ), snapshot, meta
         return compose_ask_response(
             f"{len(rows)} order(s) are pending verification.",
@@ -5830,7 +6045,7 @@ def _answer_ask_wms_legacy(conn, question):
                 else 100.0
             )
             return compose_ask_response(
-                f"Pick audit accuracy is {accuracy}% based on {snapshot['audits_total']} audit(s).",
+                f"Quality audit pass rate is {accuracy}% (passed audits ÷ total audits) based on {snapshot['audits_total']} audit(s).",
                 [
                     f"Passed: {snapshot['audits_passed']}",
                     f"Failed: {snapshot['audits_failed']}",
@@ -10840,7 +11055,7 @@ def executive_dashboard():
     c.execute("SELECT COUNT(*) FROM order_header WHERE status != 'Completed'")
     orders_pending = c.fetchone()[0]
 
-    # ── KPI 4: Pick accuracy ──────────────────────────────────────────────────
+    # ── KPI 4: Quality audit pass rate (passed audits / total audits) ─────────
     c.execute("SELECT COUNT(*) FROM quality_audits")
     total_audits = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM quality_audits WHERE result IN ('Pass', 'Passed')")
@@ -11507,13 +11722,6 @@ def executive_dashboard():
             Live operational overview &mdash; {format_executive_timestamp(now)}
         </p>
         {f"<div class='demo-session-note' style='margin-top:14px;background:#ecfdf5;border-color:#86efac;color:#166534;'>Demo session restored to the original sample warehouse baseline.</div>" if request.args.get('demo_reset') == '1' else ''}
-        <div class='ops-summary-strip'>
-            <div class='ops-summary-tile'><div class='label'>Pending Work</div><div class='value'>{orders_pending:,}</div></div>
-            <div class='ops-summary-tile'><div class='label'>Blocked Shortages</div><div class='value'>{blocked_count:,}</div></div>
-            <div class='ops-summary-tile'><div class='label'>Pending Verification</div><div class='value'>{pending_verification_count:,}</div></div>
-            <div class='ops-summary-tile'><div class='label'>Open Quality Cases</div><div class='value'>{open_quality_issue_count:,}</div></div>
-            <div class='ops-summary-tile'><div class='label'>SLA Breached</div><div class='value'>{sla_breached:,}</div></div>
-        </div>
         <div class='exec-section-switcher'>
             <button type='button' class='exec-switch-btn active' data-target='overview'>Overview</button>
             <button type='button' class='exec-switch-btn' data-target='productivity'>Productivity</button>
@@ -11553,9 +11761,9 @@ def executive_dashboard():
             </span>
         </div>
         <div class='exec-kpi-card kpi-violet'>
-            <div class='exec-kpi-eyebrow'>Pick Accuracy</div>
+            <div class='exec-kpi-eyebrow'>Quality Audit Pass Rate</div>
             <div class='exec-kpi-number'>{pick_accuracy}%</div>
-            <div class='exec-kpi-sub'>{passed_audits} of {total_audits} audits passed</div>
+            <div class='exec-kpi-sub'>{passed_audits} passed of {total_audits} audits</div>
             {pick_acc_badge}
         </div>
         <div class='exec-kpi-card kpi-teal'>
@@ -11652,7 +11860,7 @@ def executive_dashboard():
             <div style='padding:16px 0 4px 0;'>
         <div class='exec-kpi-grid'>
             <div class='exec-kpi-card' style='background:linear-gradient(135deg, #065f46, #10b981);border-left:4px solid #34d399;'>
-                <div class='exec-kpi-eyebrow' style='color:#a7f3d0;'>Pick Accuracy</div>
+                <div class='exec-kpi-eyebrow' style='color:#a7f3d0;'>Quality Audit Pass Rate</div>
                 <div class='exec-kpi-number' style='color:#6ee7b7;'>{pick_accuracy}%</div>
                 <div class='exec-kpi-sub' style='color:#a7f3d0;'>{passed_audits} passed of {total_audits} audits</div>
                 {pick_acc_badge}
@@ -11739,7 +11947,7 @@ def executive_dashboard():
                 <span class='exec-stat-value'>{on_time_rate}%</span>
             </div>
             <div style='margin-top:14px;'>
-                {_progress("Pick Accuracy", pick_accuracy, "#7c3aed")}
+                {_progress("Quality Audit Pass Rate", pick_accuracy, "#7c3aed")}
                 {_progress("Inventory Accuracy", inv_accuracy, CHART_TEAL)}
                 {_progress("On-Time Rate", on_time_rate, CHART_SUCCESS)}
             </div>
@@ -11930,7 +12138,7 @@ def executive_dashboard():
                 <span class='exec-stat-value'>{round((shipped_total / orders_all_time) * 100, 1) if orders_all_time else 0}%</span>
             </div>
             <div class='exec-stat-row'>
-                <span class='exec-stat-label'>Quality Pass Rate</span>
+                <span class='exec-stat-label'>Quality Audit Pass Rate</span>
                 <span class='exec-stat-value'>{pick_accuracy}%</span>
             </div>
             <div class='exec-stat-row'>
@@ -11952,7 +12160,7 @@ def executive_dashboard():
             <div style='margin-top:16px;'>
                 {_progress("Fulfillment Rate", shipped_total, CHART_SUCCESS, max(orders_all_time, 1))}
                 {_progress("SLA Compliance", on_time_rate, CHART_SUCCESS)}
-                {_progress("Pick Accuracy", pick_accuracy, CHART_VIOLET)}
+                {_progress("Quality Audit Pass Rate", pick_accuracy, CHART_VIOLET)}
             </div>
         </div>
     </div>
@@ -12023,61 +12231,21 @@ def executive_dashboard():
 # STARTUP
 # ======================================================
 if __name__ == "__main__":
-    ensure_session_db_dir()
     migrated = migrate_legacy_db_to_master()
     if migrated:
         print("Promoted existing enterprise_wms.db into enterprise_wms_master.db seed template.")
 
-    init_db()
-    try:
-        load_inventory()
-    except Exception as exc:
-        print(f"Warning: could not load inventory spreadsheet: {exc}")
-    bootstrap_result = ensure_bootstrap_demo_data()
-    if bootstrap_result["seeded_inventory_rows"]:
-        print(
-            f"Seeded {bootstrap_result['seeded_inventory_rows']} demo inventory row(s) because no spreadsheet inventory was available."
-        )
-    if bootstrap_result["seeded_orders"]:
-        print(
-            f"Seeded {bootstrap_result['seeded_orders']} demo order(s) with "
-            f"{bootstrap_result['seeded_quality_escalations']} quality escalation(s)."
-        )
-
-    # Keep the master template clean so every new visitor clones the same baseline.
-    conn = get_conn(use_master=True)
-    reset_summary = reset_demo_data(conn)
-    conn.commit()
-    if reset_summary["orders_removed"]:
-        print(
-            "Master seed reset cleared active warehouse workload: "
-            f"{reset_summary['status_summary']}"
-        )
-    normalized_rows = normalize_inventory_assignments(conn)
-    normalized_urgency_rows = normalize_urgency_labels(conn)
-    if normalized_rows:
-        conn.commit()
-        print(
-            f"Normalized {normalized_rows} inventory row(s) with default assignment "
-            f"{DEFAULT_INVENTORY_WAREHOUSE}/{DEFAULT_INVENTORY_LOCATION}."
-        )
-    if normalized_urgency_rows:
-        conn.commit()
-        print(f"Normalized {normalized_urgency_rows} order urgency value(s) to Standard/Urgent/Critical.")
-
-    startup_blocked_orders = enforce_quality_gate_on_pending_orders(conn)
-    if startup_blocked_orders:
-        conn.commit()
-        print(
-            "Quality gate remediation moved "
-            f"{len(startup_blocked_orders)} order(s) from Pending Verification to Picking in Progress."
-        )
-    conn.close()
+    # Ensure the shared 82-order / 0-pending baseline. Re-seed only when master is
+    # stale/missing; purge visitor clones when rebuilt so browsers pick up KPIs immediately.
+    bootstrap_application(force_orders=not db_has_demo_baseline(MASTER_DB))
 
     host, port, debug = get_runtime_config(default_port=5000)
     selected_port = prepare_runtime_port(host, port, __file__)
     if selected_port != port:
         print(f"Port {port} is busy. Starting DigiTech WMS on port {selected_port} instead.")
 
-    print("Visitor demos use isolated SQLite files under demo_sessions/ cloned from the master seed.")
+    print(
+        "Visitor demos use isolated SQLite files under demo_sessions/ cloned from the "
+        "82-order completed master seed. Reset Demo restores that same baseline."
+    )
     app.run(host=host, port=selected_port, debug=debug, use_reloader=False)

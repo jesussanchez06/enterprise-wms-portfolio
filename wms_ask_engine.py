@@ -24,13 +24,22 @@ def compose_response(headline: str, bullets: list[str] | None = None, follow_up:
 
 
 HELP_CATEGORIES = [
-    "Overview / warehouse summary",
-    "Orders & shipping (including today)",
-    "SLA healthy / at risk / breached",
-    "Inventory counts, rankings, SKU availability",
-    "Operations / picking backlog",
-    "Quality pass rate and open issues",
-    "Supervisor recommended actions",
+    "Overview / warehouse summary / remaining work / risks",
+    "Orders & shipping (open, created today, oldest, completed)",
+    "SLA healthy / at risk / breached + OTIF when measurable",
+    "Inventory counts, value, rankings, adjustments, SKU lookup",
+    "Operations / picking backlog (productivity limits explained)",
+    "Quality audit pass rate and open issues",
+    "Supervisor recommended actions / bottleneck signals",
+    "KPI definitions and DigiTech WMS / Ask WMS help",
+]
+
+KPI_DEFINITIONS = [
+    "SLA Healthy / At Risk / Breached — time left vs urgency window (Critical 2h, Urgent 4h, Standard 2 business days).",
+    "OTIF — Completed orders finished on/before SLA deadline AND picked_quantity >= expected_quantity (needs completion timestamps).",
+    "Inventory accuracy — share of positive-qty SKUs with valid warehouse + location.",
+    "Quality audit pass rate — Passed audits ÷ total quality audits × 100 (not a separate pick-accuracy metric).",
+    "Low stock — SKUs below the configured unit threshold (demo default 25).",
 ]
 
 
@@ -40,7 +49,9 @@ def _clarification(intent: str) -> str:
         "orders_by_status": "Orders Placed, Picking in Progress, Pending Verification, Blocked, or Completed",
         "inventory_summary": "SKU count, inventory value, low stock, top SKUs, or a specific SKU",
         "quality_summary": "pass rate, pending verification, or open quality issues",
-        "sla_summary": "breached orders, at-risk orders, or overall SLA summary",
+        "sla_summary": "breached orders, at-risk orders, healthy orders, or overall SLA summary",
+        "shipping_summary": "shipped today, ready/pending verification, or completed count",
+        "warehouse_summary": "executive snapshot, remaining work, recommended actions, or warehouse compare",
     }
     options = prompts.get(intent, "orders, inventory, SLA, quality, shipping, or recommended actions")
     return compose_response(
@@ -65,6 +76,7 @@ def answer_question(
     normalize_urgency: Callable,
     calculate_sla_status: Callable,
     sku_description: Callable[[str], str],
+    calculate_sla_deadline: Callable | None = None,
     debug: bool = False,
 ) -> tuple[str, dict[str, Any], dict[str, Any]]:
     """Return (html_answer, snapshot_like_meta, context_for_followups)."""
@@ -140,6 +152,18 @@ def answer_question(
         )
         return answer, snapshot, context
 
+    if intent == "unsupported_predictive":
+        answer = compose_response(
+            "Ask WMS does not forecast demand or recommend HR actions (hiring/firing).",
+            [
+                "Supported: live orders, SLA, inventory, quality, shipping, and deterministic priorities.",
+                "Missing for predictions: future demand models, labor plans, and external signals.",
+            ],
+            "Ask for remaining work, SLA risk, or recommended actions instead.",
+            footer="Unsupported predictive / personnel request.",
+        )
+        return answer, snapshot, context
+
     if confidence == "low" or intent == "unknown":
         answer = compose_response(
             "I can answer operational warehouse questions from this demo session.",
@@ -155,6 +179,8 @@ def answer_question(
         "inventory_summary",
         "quality_summary",
         "sla_summary",
+        "shipping_summary",
+        "warehouse_summary",
     }:
         return _clarification(intent), snapshot, context
 
@@ -202,6 +228,34 @@ def answer_question(
         )
         return answer, snapshot, context
 
+    if intent == "warehouse_count":
+        network = [str(name).strip() for name in (warehouses or []) if str(name).strip()]
+        if not network:
+            # Fall back to warehouses that currently hold inventory in this session.
+            network = [
+                str(r["warehouse"]).strip()
+                for r in queries.inventory_by_warehouse(conn)
+                if str(r.get("warehouse") or "").strip()
+            ]
+        if network:
+            named = ", ".join(network)
+            answer = compose_response(
+                f"You have {len(network)} warehouse(s): {named}.",
+                [
+                    "These sites are the configured WMS warehouse network for this demo.",
+                ],
+                "Ask for inventory value by warehouse.",
+                footer,
+            )
+        else:
+            answer = compose_response(
+                "No warehouses are configured in this demo session.",
+                [],
+                "Ask for a warehouse summary or inventory value.",
+                footer,
+            )
+        return answer, snapshot, context
+
     if intent == "warehouse_summary":
         open_orders = max(snapshot["orders_total"] - snapshot["completed"], 0)
         answer = compose_response(
@@ -212,10 +266,43 @@ def answer_question(
             [
                 f"Pipeline: {snapshot['orders_placed']} placed, {snapshot['picking']} picking, {snapshot['pending_verification']} pending QA.",
                 f"SLA on open work: {sla['healthy_count']} healthy, {sla['at_risk_count']} at risk, {sla['breached_count']} breached.",
-                f"Quality: pass rate {quality['pass_rate']}% with {quality['open_quality_issues']} open issue(s).",
+                f"Quality: audit pass rate {quality['pass_rate']}% with {quality['open_quality_issues']} open issue(s).",
                 f"Inventory: {snapshot['sku_count']} active SKUs / {snapshot['units_on_hand']:,} units.",
             ],
             "Ask for the top three recommended actions.",
+            footer,
+        )
+        return answer, snapshot, context
+
+    if intent == "remaining_work":
+        open_orders = max(snapshot["orders_total"] - snapshot["completed"], 0)
+        answer = compose_response(
+            f"{open_orders} order(s) remain open across the network.",
+            [
+                f"Ready/placed: {snapshot['orders_placed']}",
+                f"Picking: {snapshot['picking']}",
+                f"Pending verification: {snapshot['pending_verification']}",
+                f"Blocked: {snapshot['blocked']} | Quality Issue: {snapshot['quality_issue']}",
+                f"SLA pressure: {sla['at_risk_count']} at risk, {sla['breached_count']} breached.",
+            ],
+            "Ask for the oldest open orders or recommended actions.",
+            footer,
+        )
+        return answer, snapshot, context
+
+    if intent == "warehouse_compare":
+        rows = queries.inventory_by_warehouse(conn)
+        network = [str(name).strip() for name in (warehouses or []) if str(name).strip()]
+        bullets = [f"{r['warehouse']}: {r['units']:,} units / ${r['value']:,.2f}" for r in rows]
+        if network and len(rows) < len(network):
+            present = {r["warehouse"] for r in rows}
+            missing = [w for w in network if w not in present]
+            if missing:
+                bullets.append("No positive inventory currently at: " + ", ".join(missing))
+        answer = compose_response(
+            f"Warehouse comparison across {len(rows) or len(network)} site(s) with on-hand stock.",
+            bullets or ["No inventory rows found for comparison."],
+            "Ask for low-stock SKUs or inventory value totals.",
             footer,
         )
         return answer, snapshot, context
@@ -259,19 +346,63 @@ def answer_question(
         context["entities"] = {"urgency": "Critical", "order_ids": [r["order_number"] for r in rows]}
         return answer, snapshot, context
 
+    if intent == "orders_created_today":
+        day = entities.get("date") or now.date()
+        label = entities.get("date_label") or "today"
+        count = queries.count_received_on_date(conn, day)
+        answer = compose_response(
+            f"{count} order(s) were created/received on {label}.",
+            [
+                f"Filter: order_header.date on {label}",
+                f"Open now (all dates): {max(snapshot['orders_total'] - snapshot['completed'], 0)}",
+            ],
+            "Ask how many shipped today.",
+            footer,
+        )
+        return answer, snapshot, context
+
+    if intent == "orders_completed":
+        answer = compose_response(
+            f"{snapshot['completed']} order(s) are Completed in this demo session.",
+            [
+                f"Still open: {max(snapshot['orders_total'] - snapshot['completed'], 0)}",
+                f"Pending verification (pre-ship): {snapshot['pending_verification']}",
+            ],
+            "Ask how many shipped today or for OTIF.",
+            footer,
+        )
+        return answer, snapshot, context
+
+    if intent == "orders_oldest":
+        rows = queries.list_oldest_open_orders(conn, limit=max(limit, 8))
+        answer = compose_response(
+            f"Oldest open order backlog ({len(rows)} shown).",
+            [f"{r['order_number']} — {r['status']} / {r['urgency']} (created {r['date']})" for r in rows]
+            or ["No open orders."],
+            "Ask which of these breached SLA.",
+            footer,
+        )
+        context["entities"] = {"order_ids": [r["order_number"] for r in rows]}
+        return answer, snapshot, context
+
     if intent == "orders_by_status":
         normalized = classification.get("normalized") or ""
-        status = None
-        if "blocked" in normalized:
-            status = "Blocked"
-        elif "pending verification" in normalized or "waiting for qc" in normalized or "quality" in normalized:
-            status = "Pending Verification"
-        elif "picking" in normalized or "being picked" in normalized:
-            status = "Picking in Progress"
-        elif "placed" in normalized or "ready to pick" in normalized or "waiting to be picked" in normalized:
-            status = "Orders Placed"
-        elif "completed" in normalized or "ready to ship" in normalized:
-            status = "Completed"
+        status = entities.get("status_hint")
+        if not status:
+            if "blocked" in normalized or "stuck" in normalized or "shortage" in normalized:
+                status = "Blocked"
+            elif "pending verification" in normalized or "waiting for qc" in normalized or (
+                "quality" in normalized and "issue" not in normalized
+            ):
+                status = "Pending Verification"
+            elif "quality issue" in normalized:
+                status = "Quality Issue"
+            elif "partial" in normalized or "being picked" in normalized or "picking" in normalized:
+                status = "Picking in Progress"
+            elif "placed" in normalized or "ready to pick" in normalized or "waiting to be picked" in normalized:
+                status = "Orders Placed"
+            elif "completed" in normalized or "ready to ship" in normalized:
+                status = "Completed"
         if not status:
             return _clarification("orders_by_status"), snapshot, context
         rows = queries.list_orders(conn, status=status, limit=12)
@@ -296,6 +427,16 @@ def answer_question(
             )
             return answer, snapshot, context
         lines = [f"{line['sku']}: {line['quantity']} units" for line in detail["lines"][:8]]
+        sla_note = "SLA n/a (completed)"
+        if detail["status"] != "Completed":
+            try:
+                order_time = parse_order_datetime(detail["date"])
+                sla_key, sla_label = calculate_sla_status(
+                    order_time, normalize_urgency(detail["urgency"], "Standard"), now
+                )
+                sla_note = f"SLA: {sla_label} ({sla_key})"
+            except Exception:
+                sla_note = "SLA: unable to evaluate from order date"
         answer = compose_response(
             (
                 f"Order {detail['order_number']} is {detail['status']} "
@@ -305,9 +446,10 @@ def answer_question(
                 f"Created: {detail['date']}",
                 f"Route: {detail['source']} → {detail['destination']}",
                 f"Picked {detail['picked_quantity']} of {detail['expected_quantity']} expected units",
+                sla_note,
                 *([f"Lines: {', '.join(lines)}"] if lines else []),
             ],
-            "Ask whether this order is at SLA risk.",
+            "Ask whether this order is at SLA risk, or for recommended actions.",
             footer,
         )
         context["order_id"] = detail["order_number"]
@@ -332,9 +474,13 @@ def answer_question(
 
     if intent == "sla_breached":
         rows = sla["breached"]
+        bullets = [
+            f"{r['order_number']} ({r['urgency']}, {r['status']}) — {queries.sla_breach_cause_hint(r['status'])}"
+            for r in rows[:10]
+        ] or ["None found."]
         answer = compose_response(
             f"{len(rows)} order(s) currently breached SLA.",
-            [f"{r['order_number']} ({r['urgency']}, {r['status']})" for r in rows[:10]] or ["None found."],
+            bullets,
             "Ask for recommended actions.",
             footer,
         )
@@ -354,6 +500,85 @@ def answer_question(
             footer,
         )
         context["entities"] = {"order_ids": [r["order_number"] for r in rows]}
+        return answer, snapshot, context
+
+    if intent == "sla_healthy":
+        rows = sla["healthy"]
+        answer = compose_response(
+            f"{len(rows)} open order(s) are currently SLA healthy.",
+            [f"{r['order_number']} ({r['urgency']}, {r['status']})" for r in rows[:10]] or ["None found."],
+            "Ask which orders are at risk.",
+            footer,
+        )
+        context["entities"] = {"order_ids": [r["order_number"] for r in rows]}
+        return answer, snapshot, context
+
+    if intent == "otif_summary":
+        if calculate_sla_deadline is None:
+            answer = compose_response(
+                "OTIF cannot be computed in this session wiring.",
+                ["Need SLA deadline calculation plus completion timestamps for Completed orders."],
+                "Ask for SLA summary or completed order counts instead.",
+                footer="Unsupported OTIF metric in current configuration.",
+            )
+            return answer, snapshot, context
+        otif = queries.otif_snapshot(
+            conn,
+            parse_order_datetime=parse_order_datetime,
+            normalize_urgency=normalize_urgency,
+            calculate_sla_deadline=calculate_sla_deadline,
+        )
+        if not otif["supported"]:
+            answer = compose_response(
+                "OTIF is only partially supported here — no Completed orders had recoverable completion timestamps.",
+                [
+                    otif["definition"],
+                    f"Completed orders in session: {otif['completed_total']}",
+                    f"Missing completion timestamps: {otif['missing_completion']}",
+                    "Completion time is inferred from quality Pass audit_time or PICK/PICK_CLOSE transactions.",
+                ],
+                "Ask for SLA on open orders or shipped-today counts instead.",
+                footer="Honest OTIF gap: completion timestamps are not stored on order_header.",
+            )
+            return answer, snapshot, context
+        bullets = [
+            otif["definition"],
+            f"Measured Completed orders: {otif['measured']} (missing timestamps: {otif['missing_completion']})",
+            f"On-time: {otif['on_time_count']} | In-full: {otif['in_full_count']} | OTIF: {otif['otif_count']}",
+        ]
+        for miss in otif["samples_missed"][:4]:
+            flags = []
+            if not miss["on_time"]:
+                flags.append("late")
+            if not miss["in_full"]:
+                flags.append("short")
+            bullets.append(f"Miss example: {miss['order_number']} ({', '.join(flags) or 'flagged'})")
+        answer = compose_response(
+            f"OTIF on measured Completed orders is {otif['otif_pct']}%.",
+            bullets,
+            "Ask for breached SLA on open work.",
+            footer,
+        )
+        return answer, snapshot, context
+
+    if intent == "shipping_summary":
+        day = entities.get("date") or now.date()
+        label = entities.get("date_label") or "today"
+        shipped_today, sample = queries.count_shipped_on_date(conn, day)
+        answer = compose_response(
+            (
+                f"Shipping pulse: {shipped_today} completed on {label}, "
+                f"{snapshot['pending_verification']} pending verification, "
+                f"{snapshot['completed']} completed total."
+            ),
+            [
+                f"Ready-ish pre-ship queue = Pending Verification ({snapshot['pending_verification']})",
+                f"Blocked from shipping: {snapshot['blocked']} blocked + {snapshot['quality_issue']} quality issue",
+                *(["Examples completed: " + ", ".join(sample)] if sample else []),
+            ],
+            "Ask how many shipped today or for quality issues delaying shipping.",
+            footer,
+        )
         return answer, snapshot, context
 
     if intent == "sku_count":
@@ -485,6 +710,35 @@ def answer_question(
         )
         return answer, snapshot, context
 
+    if intent == "inventory_adjustments":
+        sku = entities.get("sku") or (prior_context or {}).get("sku")
+        rows = queries.inventory_adjustments(conn, limit=10, sku=str(sku) if sku else None)
+        if not rows:
+            answer = compose_response(
+                "No ADJUST inventory transactions were found"
+                + (f" for SKU {sku}." if sku else " in this demo session."),
+                [
+                    "Adjustments appear when Inventory corrections are posted (tx_code=ADJUST).",
+                    "This answer never invents adjustment history.",
+                ],
+                "Ask for inventory accuracy or low-stock SKUs.",
+                footer,
+            )
+            return answer, snapshot, context
+        answer = compose_response(
+            f"{len(rows)} recent inventory adjustment(s)"
+            + (f" for SKU {sku}." if sku else "."),
+            [
+                f"{r['tx_time']}: SKU {r['sku']} {r['qty_change']:+d} @ {r['warehouse']}/{r['location']}"
+                for r in rows[:8]
+            ],
+            "Ask for on-hand quantity of a SKU.",
+            footer,
+        )
+        if sku:
+            context["sku"] = sku
+        return answer, snapshot, context
+
     if intent == "picker_count":
         pickers = queries.picker_workload(conn)
         workload = {p["picker"]: p["picks"] for p in pickers}
@@ -532,12 +786,32 @@ def answer_question(
         )
         return answer, snapshot, context
 
+    if intent == "productivity_limits":
+        pickers = queries.picker_workload(conn)
+        bullets = [
+            "Pick event counts exist on inventory_transactions (tx_code=PICK), but not a full time-on-task clock.",
+            "Units/hour and picks/hour would require consistent start/stop labor timestamps per picker shift.",
+            f"Configured roster size: {len(roster) if roster else 0}",
+        ]
+        if pickers:
+            bullets.append(
+                "Observed pick events: "
+                + ", ".join(f"{p['picker']}={p['picks']}" for p in pickers[:5])
+            )
+        answer = compose_response(
+            "Productivity rates (units/hour) are not fully supported from current timestamps.",
+            bullets,
+            "Ask for picker roster, picking backlog, or recommended actions instead.",
+            footer="Honest limit: no shift-level productivity clock in schema.",
+        )
+        return answer, snapshot, context
+
     if intent == "quality_summary":
         issues = queries.open_quality_issues(conn, limit=8)
         answer = compose_response(
             (
-                f"Quality summary: pass rate {quality['pass_rate']}% "
-                f"({quality['audits_passed']}/{quality['audits_total']} audits), "
+                f"Quality summary: audit pass rate {quality['pass_rate']}% "
+                f"({quality['audits_passed']}/{quality['audits_total']} audits passed), "
                 f"{quality['pending_verification']} pending verification, "
                 f"{quality['open_quality_issues']} open quality case(s)."
             ),
@@ -570,6 +844,19 @@ def answer_question(
         )
         return answer, snapshot, context
 
+    if intent == "cross_ops_risk":
+        signals = queries.cross_ops_signals(conn, sla)
+        answer = compose_response(
+            f"Primary bottleneck signal: {signals['bottleneck']}.",
+            signals["signals"]
+            or [
+                "No strong cross-functional blockage detected from blocked/QA/SLA queues right now.",
+            ],
+            "Ask for recommended supervisor actions.",
+            rec_footer,
+        )
+        return answer, snapshot, context
+
     if intent == "planner_summary":
         mix = queries.planner_mix(conn)
         answer = compose_response(
@@ -588,6 +875,15 @@ def answer_question(
         )
         return answer, snapshot, context
 
+    if intent == "kpi_definitions":
+        answer = compose_response(
+            "DigiTech WMS KPI definitions used by Ask WMS:",
+            KPI_DEFINITIONS,
+            "Ask for the live SLA summary or inventory accuracy.",
+            footer="Static definitions + live metrics available on request.",
+        )
+        return answer, snapshot, context
+
     if intent == "help_explain":
         normalized = classification.get("normalized") or ""
         if "workflow" in normalized or "planner to shipping" in normalized:
@@ -602,7 +898,7 @@ def answer_question(
                 "Ask what the Supervisor Control Tower is for.",
                 footer="Application documentation (not a live metric query).",
             )
-        elif "sla" in normalized:
+        elif "sla" in normalized and "what is" in normalized:
             answer = compose_response(
                 "SLA states are Healthy, At Risk, and Breached based on urgency windows already configured in this WMS.",
                 [
@@ -619,6 +915,23 @@ def answer_question(
                 ["This clears that visitor's orders/picks/adjustments and Ask WMS chat for the session."],
                 "Ask how the warehouse is performing today.",
                 footer="Application documentation.",
+            )
+        elif "read only" in normalized or "readonly" in normalized or "read-only" in (question or "").lower():
+            answer = compose_response(
+                "Ask WMS is read-only: it never ships orders, adjusts stock, or changes statuses from chat.",
+                [
+                    "It classifies intent, runs controlled SELECT queries on your visitor session DB, and returns deterministic HTML answers.",
+                    "Write actions stay in Planner / Inventory / Operations / Quality / Supervisor screens.",
+                ],
+                "Try: How is the warehouse performing today?",
+                footer="Safety rule: natural language never executes writes.",
+            )
+        elif "digitech" in normalized or "ask wms" in normalized or normalized in {"help", "capabilities"}:
+            answer = compose_response(
+                "DigiTech WMS is this portfolio warehouse demo; Ask WMS is its zero-paid-API assistant over your private session database.",
+                HELP_CATEGORIES,
+                "Try: Late? or What are the top three recommended actions?",
+                footer="Ask WMS uses intent recognition, synonyms, follow-ups, and read-only SQL — not a paid LLM API.",
             )
         else:
             answer = compose_response(
