@@ -324,6 +324,7 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
             "quality pass", "pass rate", "quality summary", "pick accuracy",
             "quality audit pass rate", "audit pass rate", "qc status",
             "any quality", "open quality", "quality?", "quality problem", "quality problems",
+            "quality issue", "quality issues",
         ],
         "weight": 6,
     },
