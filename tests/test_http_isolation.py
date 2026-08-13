@@ -37,7 +37,10 @@ def test_http_planner_order_isolated_between_visitors():
 
     assert a.get("/executive").status_code == 200
     assert b.get("/executive").status_code == 200
-    assert b"Private Demo Session" in a.get("/executive").data
+    assert b"Private Demo Session" not in a.get("/executive").data
+    # Reset Demo UI removed from nav; /reset-demo route remains for optional later use
+    assert b"Reset Demo" not in a.get("/executive").data
+    assert b'action="/reset-demo"' not in a.get("/executive").data
 
     path_a = os.path.join(wms.SESSION_DB_DIR, "11111111111111111111111111111111.db")
     path_b = os.path.join(wms.SESSION_DB_DIR, "22222222222222222222222222222222.db")

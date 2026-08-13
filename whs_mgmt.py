@@ -5433,14 +5433,10 @@ def layout(content, body_class=""):
             <a href="/quality">Quality</a>
             <a href="/supervisor">Supervisor</a>
             <a href="/ask-wms">Ask WMS</a>
-            <form class="nav-reset-form" method="post" action="/reset-demo" onsubmit="return confirm('Reset your private demo workspace to the original sample warehouse? Only your browser session will be cleared.');">
-                <button class="nav-reset-btn" type="submit">Reset Demo</button>
-            </form>
         </div>
     </div>
 
     <div class="container">
-    <p class="demo-session-note"><strong>Private Demo Session</strong> &mdash; your changes are isolated to this browser session. Other recruiters on the same link start from a separate copy of the shared baseline.</p>
     """
     html += content
     html += """
