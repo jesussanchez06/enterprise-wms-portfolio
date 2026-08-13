@@ -26,14 +26,14 @@ def compose_response(headline: str, bullets: list[str] | None = None, follow_up:
 
 
 HELP_CATEGORIES = [
-    "Overview / warehouse summary / remaining work / risks / KPI attention",
-    "Orders & shipping (open, created today, oldest, completed, urgent mix)",
+    "Overview / warehouse summary / remaining work / risks / KPI attention / natural pulse",
+    "Orders & shipping (open, created today, oldest, completed, urgent mix, first/last)",
     "SLA healthy / at risk / breached + OTIF when measurable",
-    "Inventory counts, value, rankings, adjustments, SKU lookup",
-    "Operations / picking backlog (productivity limits explained)",
+    "Inventory counts, value, rankings, adjustments, movement, SKU lookup",
+    "Operations / picking backlog / picker leaders (productivity limits explained)",
     "Quality: failed audits, discrepancy reasons, auditors, history, pass rate",
     "Follow-ups after a quality order: who picked / which SKU / was it shipped",
-    "Supervisor recommended actions / bottleneck signals / AI briefing",
+    "Supervisor recommended actions / bottleneck signals / AI briefing / analytics limits",
     "KPI definitions and DigiTech WMS / Ask WMS help",
 ]
 
@@ -497,6 +497,12 @@ def answer_question(
             if picker_info.get("picker")
             else "Picker: not tracked on this order"
         )
+        ship = queries.order_ship_status(conn, detail["order_number"])
+        completion_line = (
+            f"Completed/shipped signal: {ship.get('ship_or_completion_time') or detail.get('date')}"
+            if ship.get("shipped")
+            else f"Not completed yet — current status {detail['status']}"
+        )
         answer = compose_response(
             (
                 f"Order {detail['order_number']} is {detail['status']} "
@@ -505,12 +511,14 @@ def answer_question(
             [
                 f"Created: {detail['date']}",
                 f"Route: {detail['source']} → {detail['destination']}",
+                f"Warehouse/source: {detail['source']}",
                 f"Picked {detail['picked_quantity']} of {detail['expected_quantity']} expected units",
                 picker_line,
+                completion_line,
                 sla_note,
                 *([f"Lines: {', '.join(lines)}"] if lines else []),
             ],
-            "Ask whether this order is at SLA risk, or for recommended actions.",
+            "Ask who picked it, whether it shipped, or what SKUs are on it.",
             footer,
         )
         context["order_id"] = detail["order_number"]
@@ -880,10 +888,13 @@ def answer_question(
         shipped_today, _ = queries.count_shipped_on_date(conn, now.date())
         shipped_yesterday, _ = queries.count_shipped_on_date(conn, now.date() - timedelta(days=1))
         mix = queries.planner_mix(conn)
+        active = queries.active_pickers_now(conn)
         bullets = [
-            "Units/hour and picks/hour are not fully supported — no shift-level time-on-task clock.",
+            "Units/hour and true utilization clocks are not fully supported — no shift-level time-on-task.",
             f"Configured roster size: {len(roster) if roster else 0}",
-            f"Completed volume today: {shipped_today} | yesterday: {shipped_yesterday}",
+            f"Avg orders/day proxy (today vs yesterday completed): "
+            f"{shipped_today} today / {shipped_yesterday} yesterday",
+            f"Active pickers on open picks: {len(active)}",
             "Fill rate proxy: Completed picked_quantity vs expected (see OTIF in-full component).",
             "Urgency/workload mix: "
             + (", ".join(f"{u['urgency']}={u['count']}" for u in mix["urgency"][:4]) or "none"),
@@ -896,7 +907,7 @@ def answer_question(
         answer = compose_response(
             "Productivity: live volume and pick events are available; rate metrics have honest limits.",
             bullets,
-            "Ask for OTIF, picking backlog, or average completion time.",
+            "Ask who completed the most, for OTIF, or average completion time.",
             footer="Honest limit: no shift-level productivity clock in schema.",
         )
         return answer, snapshot, context
@@ -1294,25 +1305,47 @@ def answer_question(
                 footer,
             )
             return answer, snapshot, context
-        if "longest" in normalized or "oldest" in normalized:
+        if "longest" in normalized or "oldest" in normalized or "first order" in normalized:
             rows = queries.list_oldest_open_orders(conn, limit=8)
+            if "first order" in normalized and not rows:
+                rows = queries.list_orders_by_date_extreme(conn, extreme="first", limit=5)
             answer = compose_response(
-                "Longest-open (aging) orders:",
+                "Longest-open / earliest orders:",
                 [f"{r['order_number']} — {r['status']} / {r['urgency']} ({r['date']})" for r in rows]
-                or ["No open orders."],
+                or ["No orders found."],
                 "Ask which breached SLA.",
                 footer,
             )
             return answer, snapshot, context
-        if "fastest" in normalized:
+        if "last order" in normalized or entities.get("order_extreme") == "last":
+            rows = queries.list_orders_by_date_extreme(conn, extreme="last", limit=5)
             answer = compose_response(
-                "Fastest-order ranking is not fully supported — no dedicated cycle-time leaderboard.",
+                "Most recently created order(s) in this session:",
+                [f"{r['order_number']} — {r['status']} / {r['urgency']} ({r['date']})" for r in rows]
+                or ["No orders found."],
+                "Ask for today's received orders.",
+                footer,
+            )
+            return answer, snapshot, context
+        if "fastest" in normalized or "shortest" in normalized or entities.get("order_extreme") == "shortest":
+            answer = compose_response(
+                "Fastest/shortest-order ranking is not fully supported — no dedicated cycle-time leaderboard.",
                 [
                     "Ask for average completion time (derived) or oldest open orders instead.",
                     "Per-order start/stop labor clocks are not stored as a ranked metric.",
                 ],
                 "Ask for average completion time.",
                 footer="Honest limit: no fastest-order leaderboard in schema.",
+            )
+            return answer, snapshot, context
+        if "today" in normalized and "order" in normalized and "urgent" not in normalized:
+            day = entities.get("date") or now.date()
+            count = queries.count_received_on_date(conn, day)
+            answer = compose_response(
+                f"{count} order(s) were received/created today.",
+                ["Ask for open, completed, blocked, or critical filters for today's queue."],
+                "Ask how many shipped today.",
+                footer,
             )
             return answer, snapshot, context
         urgent = [r for r in queries.list_orders(conn, urgency="Urgent", limit=50) if r["status"] != "Completed"]
@@ -1332,6 +1365,74 @@ def answer_question(
             "Ask for critical order details or recommended actions.",
             footer,
         )
+        return answer, snapshot, context
+
+    if intent == "analytics_period":
+        shipped_today, _ = queries.count_shipped_on_date(conn, now.date())
+        shipped_yesterday, _ = queries.count_shipped_on_date(conn, now.date() - timedelta(days=1))
+        created_today = queries.count_orders_created_on_date(conn, now.date())
+        created_yesterday = queries.count_orders_created_on_date(conn, now.date() - timedelta(days=1))
+        answer = compose_response(
+            "Week/month trend analytics are not fully supported in this demo session.",
+            [
+                "Visitor DB retains operational seed + session activity — not a multi-week warehouse data warehouse.",
+                f"Honest near-term compare: completed today {shipped_today} vs yesterday {shipped_yesterday}; "
+                f"created {created_today} vs {created_yesterday}.",
+                "Ask 'today vs yesterday' for the supported day-over-day pulse.",
+            ],
+            "Ask for an executive summary or OTIF on measured completed orders.",
+            footer="Honest limit: insufficient multi-week history for true weekly/monthly trends.",
+        )
+        return answer, snapshot, context
+
+    if intent == "sku_movement":
+        normalized = classification.get("normalized") or ""
+        mode = "least" if re.search(r"\b(least|slow|fewest)\b", normalized) else "most"
+        rows = queries.sku_movement_rank(conn, mode=mode, limit=max(limit, 8))
+        if not rows:
+            answer = compose_response(
+                "No inventory movement transactions were found to rank SKU activity.",
+                ["Movement uses ABS(qty_change) from inventory_transactions (PICK/RECEIPT/etc.)."],
+                "Ask for on-hand rankings instead.",
+                footer,
+            )
+            return answer, snapshot, context
+        label = "least movement" if mode == "least" else "most movement"
+        if "slow" in normalized:
+            label = "lowest observed movement (slow-moving proxy)"
+        answer = compose_response(
+            f"SKU {label} from session inventory transactions:",
+            [
+                f"SKU {r['sku']}: {r['moved']} units moved across {r['events']} event(s)"
+                for r in rows[:8]
+            ],
+            "Ask for on-hand quantity of a specific SKU.",
+            footer="Movement proxy from inventory_transactions — not a finished-goods velocity model.",
+        )
+        if rows:
+            context["sku"] = rows[0]["sku"]
+        return answer, snapshot, context
+
+    if intent == "picker_leaders":
+        normalized = classification.get("normalized") or ""
+        fewest = bool(re.search(r"\b(fewest|least|bottom)\b", normalized))
+        rows = queries.picker_workload_asc(conn, limit=5) if fewest else queries.picker_workload(conn, limit=5)
+        if not rows:
+            answer = compose_response(
+                "No picker pick-event history is available in inventory_transactions.",
+                ["Ask for the configured picker roster instead."],
+                "Ask how many pickers are configured.",
+                footer,
+            )
+            return answer, snapshot, context
+        label = "fewest pick events" if fewest else "most pick events"
+        answer = compose_response(
+            f"Pickers with the {label} (PICK transactions):",
+            [f"{r['picker']}: {r['picks']} pick event(s)" for r in rows],
+            "Ask for picking backlog or average completion time.",
+            footer="Based on inventory_transactions PICK events — not a full utilization clock.",
+        )
+        context["picker"] = rows[0]["picker"]
         return answer, snapshot, context
 
     if intent == "quality_summary":

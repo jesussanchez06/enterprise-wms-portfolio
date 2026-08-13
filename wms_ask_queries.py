@@ -972,6 +972,72 @@ def overstock_skus(conn, threshold: int = 500, limit: int = 8) -> list[dict[str,
     return [{"sku": sku, "qty": int(qty or 0)} for sku, qty in c.fetchall()]
 
 
+def sku_movement_rank(conn, mode: str = "most", limit: int = 8) -> list[dict[str, Any]]:
+    """Rank SKUs by absolute inventory transaction movement (|qty_change|)."""
+    c = conn.cursor()
+    limit = max(1, min(int(limit or 8), 20))
+    order_sql = "ORDER BY moved DESC, sku ASC" if mode != "least" else "ORDER BY moved ASC, sku ASC"
+    c.execute(
+        f"""
+        SELECT sku, COALESCE(SUM(ABS(qty_change)), 0) AS moved, COUNT(*) AS events
+        FROM inventory_transactions
+        WHERE TRIM(COALESCE(sku, '')) <> ''
+          AND qty_change IS NOT NULL
+        GROUP BY sku
+        HAVING moved > 0
+        {order_sql}
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    return [
+        {"sku": sku, "moved": int(moved or 0), "events": int(events or 0)}
+        for sku, moved, events in c.fetchall()
+    ]
+
+
+def list_orders_by_date_extreme(conn, extreme: str = "first", limit: int = 5) -> list[dict[str, Any]]:
+    """First = oldest create date; last = newest create date (session order_header.date)."""
+    c = conn.cursor()
+    limit = max(1, min(int(limit or 5), 20))
+    direction = "ASC" if extreme == "first" else "DESC"
+    c.execute(
+        f"""
+        SELECT order_number, status, urgency, date
+        FROM order_header
+        ORDER BY date {direction}, order_number {direction}
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    return [
+        {
+            "order_number": order_number,
+            "status": status,
+            "urgency": urgency,
+            "date": date,
+        }
+        for order_number, status, urgency, date in c.fetchall()
+    ]
+
+
+def picker_workload_asc(conn, limit: int = 8) -> list[dict[str, Any]]:
+    """Fewest pick events first (same PICK tx source as picker_workload)."""
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT COALESCE(user_role, 'Unassigned') AS picker_name, COUNT(*) AS pick_events
+        FROM inventory_transactions
+        WHERE tx_code = 'PICK'
+        GROUP BY picker_name
+        ORDER BY pick_events ASC, picker_name ASC
+        LIMIT ?
+        """,
+        (max(1, min(int(limit or 8), 20)),),
+    )
+    return [{"picker": name, "picks": int(count or 0)} for name, count in c.fetchall()]
+
+
 def quality_context_bundle(conn, order_number: str) -> dict[str, Any]:
     """Bundle order_id / sku / picker for Ask WMS follow-up context."""
     lines = order_lines_for(conn, order_number)

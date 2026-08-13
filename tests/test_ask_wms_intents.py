@@ -135,6 +135,12 @@ WAREHOUSE_SUMMARY = [
     "Executive summary",
     "Risks?",
     "Status?",
+    "overview",
+    "what's going on",
+    "anything wrong?",
+    "how we doing",
+    "warehouse health",
+    "operations dashboard",
 ]
 
 KPI_SNAPSHOT = [
@@ -147,6 +153,119 @@ KPI_SNAPSHOT = [
     "KPIs?",
     "Show warehouse KPIs",
     "current KPIs",
+]
+
+NATURAL_LANGUAGE = [
+    "what's going on",
+    "anything wrong",
+    "healthy?",
+    "fail today?",
+    "behind?",
+    "worried?",
+    "how we doing",
+]
+
+EXECUTIVE_EXTRA = [
+    "summarize today",
+    "completion rate",
+    "KPI needing attention",
+    "vs yesterday",
+    "biggest risk",
+]
+
+ORDER_LOOKUP_DT82 = [
+    "ORD-DT82-0036",
+    "details for ORD-DT82-0036",
+    "where is ORD-DT82-0036",
+    "status DT82-0036",
+    "order DT82-0036",
+    "is ORD-DT82-0036 delayed",
+]
+
+CROSS_MODULE_EXTRA = [
+    "quality and picker",
+    "picker quality issues",
+    "warehouse delays",
+    "SKUs causing delays",
+    "blocked by inventory",
+    "shortages to SLA",
+]
+
+ANALYTICS_PERIOD = [
+    "this week",
+    "this month",
+    "trends",
+]
+
+SKU_MOVEMENT = [
+    "slow-moving SKUs",
+    "SKU that moved most",
+    "moved least",
+    "inventory movement",
+]
+
+PICKER_LEADERS = [
+    "who completed most",
+    "who completed fewest",
+]
+
+OPS_PHRASES = [
+    "ready picks",
+    "ops summary",
+    "avg orders per day",
+    "utilization",
+]
+
+PLANNER = [
+    "Planner summary",
+    "urgency mix",
+    "workload by destination",
+    "ship first",
+    "inventory need",
+]
+
+SUPERVISOR = [
+    "Supervisor summary",
+    "control tower status",
+    "needs my attention",
+    "alerts",
+    "shortages",
+]
+
+CROSS_OPS = [
+    "What's the bottleneck?",
+    "quality blocking shipping",
+    "inventory causing sla delays",
+    "what's blocking fulfillment",
+    "quality to shipping",
+]
+
+AI_BRIEFING = [
+    "What should I focus on today?",
+    "summarize performance",
+    "biggest risk right now",
+    "vs yesterday",
+    "30 minute review first",
+    "why delays",
+    "improve what",
+    "investigate first",
+]
+
+KPI_ATTENTION = [
+    "Which KPI needs attention?",
+    "kpi needs attention",
+    "which metric needs attention",
+    "KPI needing attention",
+    "KPIs below target",
+]
+
+PRODUCTIVITY = [
+    "What's our productivity?",
+    "units per hour",
+    "picker productivity",
+    "picks per hour",
+    "throughput",
+    "utilization",
 ]
 
 WAREHOUSE_COUNT = [
@@ -257,20 +376,6 @@ UNSUPPORTED = [
     "Should we hire more pickers next week?",
 ]
 
-PRODUCTIVITY = [
-    "What's our productivity?",
-    "units per hour",
-    "picker productivity",
-    "picks per hour",
-]
-
-CROSS_OPS = [
-    "What's the bottleneck?",
-    "quality blocking shipping",
-    "inventory causing sla delays",
-    "what's blocking fulfillment",
-]
-
 KPI_DEFS = [
     "What is SLA?",
     "Define OTIF",
@@ -285,18 +390,6 @@ HELP = [
     "What is DigiTech WMS?",
     "Is Ask WMS read only?",
     "capabilities",
-]
-
-PLANNER = [
-    "Planner summary",
-    "urgency mix",
-    "workload by destination",
-]
-
-SUPERVISOR = [
-    "Supervisor summary",
-    "control tower status",
-    "needs my attention",
 ]
 
 ADJUSTMENTS = [
@@ -611,6 +704,8 @@ def test_casual_recruiter_language():
         "recommended_actions",
     }
     assert _intent("show me the hot priorities") == "recommended_actions"
+    assert _intent("anything wrong?") == "warehouse_summary"
+    assert _intent("what's going on") == "warehouse_summary"
 
 
 def test_ambiguous_and_unknown():
@@ -651,20 +746,6 @@ QUALITY_AUDITOR = [
     "Who audited?",
     "Which auditor?",
     "who inspected?",
-]
-
-KPI_ATTENTION = [
-    "Which KPI needs attention?",
-    "kpi needs attention",
-    "which metric needs attention",
-]
-
-AI_BRIEFING = [
-    "What should I focus on today?",
-    "summarize performance",
-    "biggest risk right now",
-    "vs yesterday",
-    "30 minute review first",
 ]
 
 AVG_COMPLETION = [
@@ -727,6 +808,9 @@ def test_ord_dt82_entity_extraction():
     result = _result("Tell me about ORD-DT82-0036")
     assert result["entities"].get("order_id") == "ORD-DT82-0036"
 
+    result = _result("status DT82-0036")
+    assert result["entities"].get("order_id") == "ORD-DT82-0036"
+
 
 def test_quality_follow_ups_with_context():
     prior = {
@@ -759,12 +843,75 @@ def test_context_shipped_intent(phrase):
     assert _intent(phrase) == "context_shipped", phrase
 
 
+@pytest.mark.parametrize("phrase", NATURAL_LANGUAGE)
+def test_natural_language_pulse(phrase):
+    assert _intent(phrase) == "warehouse_summary", phrase
+
+
+@pytest.mark.parametrize("phrase", EXECUTIVE_EXTRA)
+def test_executive_extra_intents(phrase):
+    intent = _intent(phrase)
+    assert intent in {
+        "warehouse_summary",
+        "ai_briefing",
+        "kpi_attention",
+        "kpi_snapshot",
+    }, (phrase, intent)
+
+
+@pytest.mark.parametrize("phrase", ORDER_LOOKUP_DT82)
+def test_order_lookup_dt82_intents(phrase):
+    result = _result(phrase)
+    assert result["intent"] == "order_status", (phrase, result["intent"])
+    assert result["entities"].get("order_id") == "ORD-DT82-0036", phrase
+
+
+def test_order_lookup_facets_dt82():
+    assert _intent("who picked ORD-DT82-0036") == "context_picker"
+    assert _result("who picked ORD-DT82-0036")["entities"].get("order_id") == "ORD-DT82-0036"
+    assert _intent("was ORD-DT82-0036 shipped") == "context_shipped"
+    assert _intent("SKUs on ORD-DT82-0036") == "context_sku"
+    assert _intent("who verified ORD-DT82-0036") == "quality_auditor"
+
+
+@pytest.mark.parametrize("phrase", CROSS_MODULE_EXTRA)
+def test_cross_module_extra(phrase):
+    assert _intent(phrase) == "cross_ops_risk", phrase
+
+
+@pytest.mark.parametrize("phrase", ANALYTICS_PERIOD)
+def test_analytics_period(phrase):
+    assert _intent(phrase) == "analytics_period", phrase
+
+
+@pytest.mark.parametrize("phrase", SKU_MOVEMENT)
+def test_sku_movement(phrase):
+    assert _intent(phrase) == "sku_movement", phrase
+
+
+@pytest.mark.parametrize("phrase", PICKER_LEADERS)
+def test_picker_leaders(phrase):
+    assert _intent(phrase) == "picker_leaders", phrase
+
+
+@pytest.mark.parametrize("phrase", OPS_PHRASES)
+def test_ops_phrases(phrase):
+    intent = _intent(phrase)
+    assert intent in {
+        "picking_summary",
+        "warehouse_summary",
+        "productivity_limits",
+        "orders_completed",
+        "remaining_work",
+    }, (phrase, intent)
+
+
 def test_intent_catalog_size():
-    assert len(INTENT_DEFS) >= 48
+    assert len(INTENT_DEFS) >= 52
 
 
 def test_concept_and_spelling_coverage():
-    assert len(CONCEPTS) >= 20
+    assert len(CONCEPTS) >= 22
     assert len(SPELLING_FIXES) >= 40
 
 
@@ -785,6 +932,14 @@ def test_phrase_variation_count_floor():
         PICKER_COUNT,
         WAREHOUSE_SUMMARY,
         KPI_SNAPSHOT,
+        NATURAL_LANGUAGE,
+        EXECUTIVE_EXTRA,
+        ORDER_LOOKUP_DT82,
+        CROSS_MODULE_EXTRA,
+        ANALYTICS_PERIOD,
+        SKU_MOVEMENT,
+        PICKER_LEADERS,
+        OPS_PHRASES,
         WAREHOUSE_COUNT,
         WAREHOUSE_COMPARE,
         ORDERS_OPEN,
@@ -819,7 +974,7 @@ def test_phrase_variation_count_floor():
         CONTEXT_SHIPPED,
     ]
     total = sum(len(b) for b in buckets)
-    assert total >= 180, total
+    assert total >= 220, total
 
 
 if __name__ == "__main__":

@@ -21,14 +21,18 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
         "weight": 6,
     },
     "warehouse_summary": {
-        "concepts": ["executive", "orders"],
+        "concepts": ["executive", "orders", "natural"],
         "phrases": [
-            "warehouse summary", "how is the warehouse", "how are we doing", "executive summary",
-            "summarize today", "operations summary", "overall performance", "biggest issue",
-            "operational risk", "end to end", "kpi overview", "scorecard", "pulse check",
-            "ops snapshot", "management summary", "how is digitech", "warehouse performing",
-            "how are operations", "risk overview", "remaining risk", "warehouse health",
-            "completion rate", "top kpi", "executive overview",
+            "warehouse summary", "how is the warehouse", "how are we doing", "how we doing",
+            "executive summary", "summarize today", "operations summary", "overall performance",
+            "biggest issue", "operational risk", "end to end", "kpi overview", "scorecard",
+            "pulse check", "ops snapshot", "management summary", "how is digitech",
+            "warehouse performing", "how are operations", "risk overview", "remaining risk",
+            "warehouse health", "completion rate", "top kpi", "executive overview",
+            "overview", "what's going on", "whats going on", "anything wrong", "worried",
+            "ops summary", "operations dashboard", "ops dashboard", "status check",
+            "all good", "how healthy", "are we healthy", "healthy?", "goals",
+            "behind?", "are we behind", "anything fail today", "fail today",
         ],
         "weight": 5,
     },
@@ -40,6 +44,56 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
             "list kpi", "kpi today", "kpi status", "our kpi", "warehouse kpi",
             "key performance", "performance indicator", "show me today kpi",
             "give me the important kpi", "what kpi",
+        ],
+        "weight": 8,
+    },
+    "kpi_attention": {
+        "concepts": ["executive", "priority"],
+        "phrases": [
+            "which kpi needs attention", "kpi needs attention", "which kpi is off",
+            "kpi attention", "what kpi is off", "which metric needs", "kpi below target",
+            "kpis below target", "kpi needing attention", "needing attention",
+            "metric needing attention", "which kpi needing",
+        ],
+        "weight": 8,
+    },
+    "ai_briefing": {
+        "concepts": ["ai_analysis", "executive", "priority", "analytics"],
+        "phrases": [
+            "focus today", "what should i focus", "summarize performance", "biggest risk",
+            "kpis below target", "vs yesterday", "versus yesterday", "compared to yesterday",
+            "30 minute review", "thirty minute", "review first", "inventory attention",
+            "warehouse attention", "why productivity", "ai analysis", "first look",
+            "today vs yesterday", "why delays", "why delay", "improve what",
+            "what should we improve", "investigate first", "what to investigate",
+            "summarize", "copilot", "ai briefing",
+        ],
+        "weight": 8,
+    },
+    "analytics_period": {
+        "concepts": ["analytics", "executive"],
+        "phrases": [
+            "this week", "this month", "weekly trend", "monthly trend", "week over week",
+            "month over month", "long term trend", "trends?", "show trends",
+            "analytics trend", "historical trend", "last week", "last month",
+        ],
+        "weight": 8,
+    },
+    "sku_movement": {
+        "concepts": ["inventory"],
+        "phrases": [
+            "slow moving", "slow-moving", "moved most", "moved least", "sku movement",
+            "inventory movement", "which sku moved", "movement trend", "most movement",
+            "least movement", "sku that moved",
+        ],
+        "weight": 8,
+    },
+    "picker_leaders": {
+        "concepts": ["picking", "productivity"],
+        "phrases": [
+            "who completed most", "who completed fewest", "who picked most", "who picked least",
+            "most productive picker", "fewest orders picker", "top picker", "bottom picker",
+            "picker leaderboard", "who did the most", "who did the least",
         ],
         "weight": 8,
     },
@@ -90,6 +144,7 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
             "shipping queue", "outbound summary", "what is ready to ship", "ship pending",
             "orders ready for shipping", "shipping status", "shipping performance",
             "shipping volume", "shipping sla", "shipping trend", "late shipment",
+            "delayed shipment", "missed shipping",
         ],
         "weight": 6,
     },
@@ -107,7 +162,8 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
         "phrases": [
             "created today", "received today", "orders today", "new order today",
             "how many order today", "orders placed today", "demand today", "incoming today",
-            "order created today", "order received today",
+            "order created today", "order received today", "today's order", "todays order",
+            "order for today",
         ],
         "weight": 7,
     },
@@ -124,7 +180,7 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
         "phrases": [
             "oldest order", "oldest open", "longest waiting", "aging order", "aging backlog",
             "age of backlog", "which order is oldest", "stale order", "first in queue",
-            "longest open",
+            "longest open", "first order", "oldest first",
         ],
         "weight": 7,
     },
@@ -150,6 +206,7 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
         "phrases": [
             "status of order", "what happened with order", "order status", "where is order",
             "tell me about order", "look up order", "details for order", "info on order",
+            "when was", "when completed", "who verified",
         ],
         "weight": 8,
         "requires": ["order_id"],
@@ -167,6 +224,7 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
         "phrases": [
             "breached", "overdue", "late order", "past deadline", "whats late", "what's late",
             "missed sla", "past due", "late?", "anything late", "who is late",
+            "delayed order", "delayed shipment", "anything delayed",
         ],
         "weight": 7,
     },
@@ -182,7 +240,7 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
         "concepts": ["sla"],
         "phrases": [
             "healthy sla", "within window", "on track sla", "orders that are healthy",
-            "sla healthy", "still healthy",
+            "sla healthy", "still healthy", "on time order", "on-time order",
         ],
         "weight": 6,
     },
@@ -268,7 +326,7 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
         "phrases": [
             "low stock", "running low", "out of stock", "need restock", "skus need attention",
             "stockout", "zero stock", "below threshold", "overstock", "over stock",
-            "inventory warning", "stock warning", "units on hand",
+            "inventory warning", "stock warning", "units on hand", "inventory warnings",
         ],
         "weight": 7,
     },
@@ -285,6 +343,7 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
         "phrases": [
             "inventory adjustment", "stock adjustment", "adjust transaction", "recent adjustment",
             "cycle count", "qty correction", "inventory correction", "adjusted stock",
+            "inventory discrepanc", "stock discrepanc", "discrepancies",
         ],
         "weight": 7,
     },
@@ -301,10 +360,11 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
     "picking_summary": {
         "concepts": ["picking", "capacity"],
         "phrases": [
-            "ready to pick", "picks in progress", "workboard", "picking productivity",
+            "ready to pick", "ready picks", "picks in progress", "workboard", "picking productivity",
             "who is picking", "backlog", "work queue", "picker workload", "picking backlog",
             "pick queue", "ops queue", "picking summary", "pipeline", "waiting verification",
             "recently finished", "active pickers", "most orders picker", "blocked shortages",
+            "operations queue", "ops performance",
         ],
         "weight": 6,
     },
@@ -314,7 +374,8 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
             "productivity", "units per hour", "picks per hour", "throughput rate",
             "picker productivity", "how productive", "efficiency rate", "output rate",
             "avg daily volume", "average daily volume", "fill rate", "workload by responsibility",
-            "productivity trend", "daily volume",
+            "productivity trend", "daily volume", "utilization", "avg orders per day",
+            "average orders per day", "orders per day", "throughput", "productivity metrics",
         ],
         "weight": 7,
     },
@@ -324,7 +385,8 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
             "quality pass", "pass rate", "quality summary", "pick accuracy",
             "quality audit pass rate", "audit pass rate", "qc status",
             "any quality", "open quality", "quality?", "quality problem", "quality problems",
-            "quality issue", "quality issues",
+            "quality issue", "quality issues", "quality dashboard", "passed audit",
+            "quality trend", "quality trends",
         ],
         "weight": 6,
     },
@@ -347,7 +409,7 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
             "show failed audit", "failed audits", "list failed audit", "quality history",
             "today's audit", "todays audit", "audits today", "show quality issue",
             "list quality issue", "show audits", "audit history",
-            "recent audit", "all failed",
+            "recent audit", "all failed", "passed audits", "list passed audit",
         ],
         "weight": 8,
     },
@@ -356,6 +418,7 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
         "phrases": [
             "who audited", "which auditor", "who was the auditor", "auditor?",
             "who inspected", "which inspector", "who did the audit", "audited by",
+            "who verified", "which verifier",
         ],
         "weight": 9,
     },
@@ -372,7 +435,7 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
         "phrases": [
             "what sku was involved", "which sku was involved", "what sku", "which sku",
             "sku involved", "what part was involved", "which part was on", "lines on it",
-            "what was the sku",
+            "what was the sku", "skus on", "sku on order",
         ],
         "weight": 8,
     },
@@ -381,34 +444,17 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
         "phrases": [
             "was it shipped", "did it ship", "has it shipped", "was that shipped",
             "did that order ship", "shipped yet", "is it completed", "did it complete",
+            "was shipped", "has shipped",
         ],
         "weight": 9,
     },
-    "kpi_attention": {
-        "concepts": ["executive", "priority"],
-        "phrases": [
-            "which kpi needs attention", "kpi needs attention", "which kpi is off",
-            "kpi attention", "what kpi is off", "which metric needs", "kpi below target",
-        ],
-        "weight": 8,
-    },
-    "ai_briefing": {
-        "concepts": ["ai_analysis", "executive", "priority"],
-        "phrases": [
-            "focus today", "what should i focus", "summarize performance", "biggest risk",
-            "kpis below target", "vs yesterday",
-            "versus yesterday", "compared to yesterday", "30 minute review", "thirty minute",
-            "review first", "inventory attention", "warehouse attention", "why productivity",
-            "ai analysis", "first look",
-        ],
-        "weight": 8,
-    },
     "avg_completion_time": {
-        "concepts": ["orders", "productivity", "executive"],
+        "concepts": ["orders", "productivity", "executive", "shipping"],
         "phrases": [
             "average completion time", "avg completion time", "avg completion",
             "mean completion time", "how long to complete", "average cycle time",
-            "average order time", "completion time average",
+            "average order time", "completion time average", "average ship time",
+            "avg ship time", "mean ship time", "average shipping time",
         ],
         "weight": 9,
     },
@@ -417,7 +463,9 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
         "phrases": [
             "urgent order", "count urgent", "how many urgent", "urgent critical blocked",
             "blocked waiting inventory", "missed sla", "longest order",
-            "fastest order", "completed today list", "list completed today",
+            "fastest order", "shortest order", "first order", "last order",
+            "completed today list", "list completed today", "delayed order",
+            "on time order", "on-time order", "today's order", "todays order",
         ],
         "weight": 6,
     },
@@ -427,7 +475,8 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
             "needs my attention", "control tower", "control tower status", "supervisor summary",
             "supervisor view", "supervisor", "escalation", "operational risk", "under pressure",
             "floor issues", "supervisor status", "escalations", "dashboard summary",
-            "healthy urgency", "urgency mix supervisor",
+            "healthy urgency", "urgency mix supervisor", "supervisor dashboard",
+            "alerts", "alert", "shortages", "shortage alerts",
         ],
         "weight": 7,
     },
@@ -436,16 +485,21 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
         "phrases": [
             "planner", "order planning", "destination", "urgency mix", "planned workload", "release",
             "planner summary", "order planning summary", "planning view", "workload by destination",
+            "ship first", "what should ship first", "prioritize order", "inventory need",
+            "planning prioritize", "recommend ship",
         ],
         "weight": 5,
     },
     "cross_ops_risk": {
-        "concepts": ["sla", "inventory", "quality", "shipping", "supervisor"],
+        "concepts": ["sla", "inventory", "quality", "shipping", "supervisor", "blocked"],
         "phrases": [
             "inventory causing sla", "stock delaying", "quality blocking ship",
             "quality delaying shipping", "what is the bottleneck", "what's the bottleneck",
             "bottleneck", "cross functional risk", "inventory vs sla", "quality vs shipping",
             "what's blocking fulfillment", "root cause of delay", "blocking fulfillment",
+            "quality and picker", "picker quality", "warehouse delays", "skus causing delay",
+            "sku causing delay", "blocked by inventory", "quality to shipping",
+            "shortages to sla", "shortage causing sla", "cross module",
         ],
         "weight": 8,
     },
@@ -504,10 +558,12 @@ SHORT_FORM_MAP = {
     "late": "sla_breached",
     "overdue": "sla_breached",
     "breached": "sla_breached",
+    "delayed": "sla_breached",
     "priority": "recommended_actions",
     "priorities": "recommended_actions",
     "action": "recommended_actions",
     "actions": "recommended_actions",
+    "goals": "recommended_actions",
     "inventory": "inventory_summary",
     "stock": "inventory_summary",
     "quality": "quality_summary",
@@ -515,6 +571,7 @@ SHORT_FORM_MAP = {
     "audits": "quality_audits_list",
     "auditor": "quality_auditor",
     "discrepancy": "quality_failed_detail",
+    "discrepancies": "inventory_adjustments",
     "damage": "quality_failed_detail",
     "mistake": "quality_failed_detail",
     "shipping": "shipping_summary",
@@ -527,18 +584,42 @@ SHORT_FORM_MAP = {
     "help": "help_explain",
     "backlog": "remaining_work",
     "bottleneck": "cross_ops_risk",
+    "bottlenecks": "cross_ops_risk",
     "risks": "warehouse_summary",
     "risk": "warehouse_summary",
     "kpis": "kpi_snapshot",
     "kpi": "kpi_snapshot",
     "status": "warehouse_summary",
+    "overview": "warehouse_summary",
+    "summarize": "ai_briefing",
+    "summary": "warehouse_summary",
+    "alerts": "supervisor_summary",
+    "alert": "supervisor_summary",
+    "shortages": "supervisor_summary",
+    "shortage": "supervisor_summary",
+    "trends": "analytics_period",
+    "trend": "analytics_period",
+    "worried": "warehouse_summary",
+    "behind": "warehouse_summary",
+    "healthy": "warehouse_summary",
+    "attention": "recommended_actions",
+    "pipeline": "picking_summary",
+    "queue": "remaining_work",
+    "utilization": "productivity_limits",
+    "throughput": "productivity_limits",
 }
 
 
 def intent_family_for(intent: str | None) -> str | None:
-    if intent in INVENTORY_RANKING_INTENTS:
+    if intent in INVENTORY_RANKING_INTENTS or intent in {"sku_movement"}:
         return "inventory_ranking"
-    if intent in {"picking_summary", "picker_count", "productivity_limits", "context_picker"}:
+    if intent in {
+        "picking_summary",
+        "picker_count",
+        "productivity_limits",
+        "context_picker",
+        "picker_leaders",
+    }:
         return "picking"
     if intent in {
         "warehouse_count",
@@ -549,6 +630,7 @@ def intent_family_for(intent: str | None) -> str | None:
         "kpi_attention",
         "ai_briefing",
         "avg_completion_time",
+        "analytics_period",
     }:
         return "warehouse_network"
     if intent in {"sla_summary", "sla_breached", "sla_at_risk", "sla_healthy", "otif_summary"}:
@@ -1009,27 +1091,147 @@ def classify_intent(question: str, warehouses: list[str] | None = None, prior_co
         scores["context_shipped"] += 18
         scores["shipping_today"] -= 10
 
-    if re.search(r"\b(which kpi|kpi needs attention|kpi attention|metric needs)\b", normalized):
+    if re.search(r"\b(which kpi|kpi needs attention|kpi attention|metric needs|kpi needing|needing attention|below target)\b", normalized):
         scores["kpi_attention"] += 24
         scores["kpi_snapshot"] -= 18
         scores["recommended_actions"] -= 6
     if hits.get("ai_analysis") or re.search(
         r"\b(focus today|summarize performance|biggest risk|vs yesterday|30 minute|thirty minute|"
-        r"below target|first look|ai analysis|review first)\b",
+        r"below target|first look|ai analysis|review first|why delay|improve what|investigate first|"
+        r"today vs yesterday|summarize)\b",
         normalized,
     ):
         scores["ai_briefing"] += 16
         if re.search(r"\btop\s+(3|three)\s+actions?\b", normalized) and "recommend" not in normalized:
             scores["ai_briefing"] += 4
     if re.search(r"\b(average|avg|mean)\b", normalized) and re.search(
-        r"\b(completion|cycle)\s+time\b", normalized
+        r"\b(completion|cycle|ship)\s+time\b", normalized
     ):
         scores["avg_completion_time"] += 20
 
     # Live KPI values should not steal "which KPI needs attention"
-    if re.search(r"\bkpi\b", normalized) and re.search(r"\battention\b", normalized):
-        scores["kpi_attention"] += 10
-        scores["kpi_snapshot"] -= 12
+    if re.search(r"\bkpi\b", normalized) and re.search(r"\b(attention|needing|below)\b", normalized):
+        scores["kpi_attention"] += 14
+        scores["kpi_snapshot"] -= 16
+
+    # Natural-language ops pulse → warehouse_summary (not bare SLA healthy).
+    if (
+        re.search(
+            r"\b(what'?s going on|whats going on|anything wrong|how we doing|how are we|"
+            r"worried|are we behind|behind\?|healthy\?|how healthy|warehouse health|"
+            r"ops (summary|dashboard)|operations (summary|dashboard)|status check|"
+            r"all good|fail today|anything fail)\b",
+            normalized,
+        )
+        or normalized in {"overview", "summarize", "healthy", "worried", "behind", "goals"}
+        or (normalized == "overview" or re.search(r"\boverview\b", normalized))
+    ) and not re.search(r"\b(sla|service level|otif)\b", normalized):
+        scores["warehouse_summary"] += 18
+        scores["sla_healthy"] -= 12
+        scores["quality_failed_detail"] -= 8
+        if re.search(r"\b(fail today|anything fail|anything wrong|worried|behind)\b", normalized):
+            scores["warehouse_summary"] += 4
+    if re.search(r"\b(service level|sla)\b", normalized) and re.search(r"\b(overview|summary|compliance|status)\b", normalized):
+        scores["sla_summary"] += 16
+        scores["warehouse_summary"] -= 10
+
+    if re.search(r"\b(this week|this month|last week|last month|weekly|monthly|trends?)\b", normalized) and not re.search(
+        r"\b(vs yesterday|versus yesterday|today)\b", normalized
+    ):
+        scores["analytics_period"] += 20
+        scores["ai_briefing"] -= 6
+        scores["unsupported_predictive"] -= 4
+
+    if re.search(r"\b(slow[- ]?moving|moved (most|least)|sku movement|inventory movement|most movement|least movement)\b", normalized):
+        scores["sku_movement"] += 18
+        scores["top_inventory_qty"] -= 8
+        scores["least_inventory_qty"] -= 4
+
+    if re.search(
+        r"\b(who (completed|picked|did) (the )?(most|least|fewest)|top picker|bottom picker|picker leaderboard)\b",
+        normalized,
+    ):
+        scores["picker_leaders"] += 20
+        scores["picker_count"] -= 10
+        scores["productivity_limits"] -= 4
+
+    if re.search(r"\b(shipping performance|shipping volume|shipping trend)\b", normalized):
+        scores["shipping_summary"] += 14
+        scores["productivity_limits"] -= 10
+
+    if re.search(r"\b(delayed (order|shipment)|anything delayed)\b", normalized):
+        scores["sla_breached"] += 16
+        scores["shipping_today"] -= 10
+
+    if re.search(r"\b(today'?s order|todays order|orders? for today)\b", normalized) and not re.search(
+        r"\b(ship|complet|sla|kpi)\b", normalized
+    ):
+        scores["orders_created_today"] += 14
+
+    if re.search(r"\b(first order|oldest order)\b", normalized):
+        scores["orders_oldest"] += 14
+        scores["orders_urgent_mix"] -= 6
+    if re.search(r"\b(last order|newest order|most recent order)\b", normalized):
+        scores["orders_urgent_mix"] += 12
+        entities["order_extreme"] = "last"
+    if re.search(r"\b(shortest|fastest) order\b", normalized):
+        scores["orders_urgent_mix"] += 12
+        entities["order_extreme"] = "shortest"
+    if re.search(r"\b(on[- ]?time order)\b", normalized):
+        scores["sla_healthy"] += 14
+
+    if re.search(r"\b(ready picks|ready to pick)\b", normalized):
+        scores["picking_summary"] += 14
+    if re.search(r"\b(quality dashboard|passed audit|quality trend)\b", normalized):
+        scores["quality_summary"] += 12
+        if "passed" in normalized:
+            scores["quality_audits_list"] += 10
+    if re.search(r"\b(alerts?|shortages?)\b", normalized) and not re.search(r"\b(order|blocked)\b", normalized):
+        scores["supervisor_summary"] += 14
+    if re.search(r"\b(ship first|inventory need|prioritize order)\b", normalized):
+        scores["planner_summary"] += 14
+        scores["recommended_actions"] -= 4
+    if re.search(
+        r"\b(quality and picker|picker quality|warehouse delays|sku.? causing|blocked by inventory|"
+        r"shortages? to sla|shortage causing)\b",
+        normalized,
+    ):
+        scores["cross_ops_risk"] += 18
+
+    if re.search(r"\b(avg|average)\s+orders?\s+per\s+day\b", normalized) or re.search(
+        r"\borders?\s+per\s+day\b", normalized
+    ):
+        scores["productivity_limits"] += 18
+    if re.search(r"\b(completed ops|ops completed|operations completed)\b", normalized):
+        scores["orders_completed"] += 16
+        scores["picking_summary"] += 4
+    if re.search(r"\b(quality trend)\b", normalized):
+        scores["quality_summary"] += 14
+        scores["analytics_period"] -= 8
+    if re.search(r"\b(inventory trend)\b", normalized):
+        scores["sku_movement"] += 14
+        scores["analytics_period"] -= 8
+
+    # Order-id facet routing: prefer contextual intents over generic order_status.
+    if entities.get("order_id") and not hits.get("write_request"):
+        scores["order_status"] += 10
+        if re.search(r"\b(who picked|picked by|which picker)\b", normalized):
+            scores["context_picker"] += 22
+            scores["order_status"] -= 8
+        if re.search(r"\b(was .* shipped|did .* ship|has .* shipped|shipped\??)\b", normalized) or re.search(
+            r"\b(shipped|did it ship)\b", normalized
+        ):
+            scores["context_shipped"] += 22
+            scores["order_status"] -= 8
+        if re.search(r"\b(sku|skus|lines?|parts?)\b", normalized):
+            scores["context_sku"] += 22
+            scores["order_status"] -= 10
+            scores["top_inventory_qty"] -= 8
+        if re.search(r"\b(who verified|who audited|auditor|verified)\b", normalized):
+            scores["quality_auditor"] += 18
+            scores["order_status"] -= 6
+        if re.search(r"\b(delayed|late|at risk|sla)\b", normalized):
+            scores["order_status"] += 8
 
     inventoryish = bool(hits.get("inventory")) or bool(
         re.search(r"\b(sku|part|stock|inventory|units?)\b", normalized)

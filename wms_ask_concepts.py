@@ -11,29 +11,35 @@ CONCEPTS: dict[str, set[str]] = {
     "shipping": {
         "ship", "shipped", "shipping", "shipment", "shipments", "went out", "dispatched",
         "completed shipment", "go out", "wentout", "outbound", "ready to ship", "left the dock",
-        "dock", "carrier", "fulfillment complete",
+        "dock", "carrier", "fulfillment complete", "ship first", "ship time", "avg ship",
+        "delayed shipment", "shipping volume", "shipping performance", "shipping trend",
     },
     "orders": {
         "order", "orders", "work", "workload", "jobs", "job", "requests", "request",
         "backlog", "pipeline", "demand", "ticket", "tickets", "open work",
+        "today's orders", "todays orders", "received", "pending", "first order", "last order",
+        "longest", "shortest", "delayed", "on time orders",
     },
     "inventory": {
         "inventory", "stock", "units available", "available quantity", "on hand", "onhand",
         "stock level", "material", "sku", "skus", "part", "parts", "part number",
         "worth", "value", "valuable", "dollar", "dollars", "money", "on-hand",
-        "availability", "qty", "quantity", "bin", "location",
+        "availability", "qty", "quantity", "bin", "location", "overstock", "warning",
+        "warnings", "movement", "moved", "slow moving", "slow-moving", "discrepanc",
+        "inventory need", "inventory trend",
     },
     "quality": {
         "quality", "qc", "audit", "audits", "inspection", "verification", "discrepancy",
         "defect", "damage", "accuracy", "qa", "pass rate", "failed audit", "escalation",
         "escalations", "failed", "fail", "failed inspection", "mistake", "carton",
         "crush", "auditor", "audited", "inspector", "quality issue", "quality history",
-        "re-audit", "reaudit",
+        "re-audit", "reaudit", "quality dashboard", "passed audit", "quality trend",
+        "who verified", "verified",
     },
     "sla": {
         "sla", "deadline", "due", "late", "overdue", "at risk", "atrisk", "breached",
         "service level", "miss", "missing sla", "compliance", "on time", "ontime",
-        "healthy", "timer", "past due",
+        "healthy", "timer", "past due", "delayed", "behind", "missed sla",
     },
     "otif": {
         "otif", "on time in full", "on-time in-full", "ontime in full", "fill rate",
@@ -43,16 +49,18 @@ CONCEPTS: dict[str, set[str]] = {
         "priority", "priorities", "focus", "attention", "action", "actions",
         "recommendation", "recommendations", "what should we do", "what should i do",
         "what needs attention", "next step", "next steps", "recomendation", "recomendations",
-        "what first", "triage",
+        "what first", "triage", "goals", "improve", "investigate",
     },
     "productivity": {
         "productivity", "throughput", "output", "performance", "completed per hour",
         "units per hour", "picks per hour", "efficiency", "rate of work",
+        "utilization", "avg orders", "orders per day", "who completed", "fewest",
+        "workload by responsibility",
     },
     "picking": {
         "pick", "picking", "picker", "pickers", "picked", "fulfillment", "workboard",
-        "work queue", "ready to pick", "pick queue", "who picked", "who is picking",
-        "active picker", "most orders",
+        "work queue", "ready to pick", "ready picks", "pick queue", "who picked",
+        "who is picking", "active picker", "most orders", "ops queue",
     },
     "capacity": {
         "capacity", "backlog", "queue", "remaining work", "work remaining",
@@ -60,32 +68,49 @@ CONCEPTS: dict[str, set[str]] = {
     },
     "supervisor": {
         "supervisor", "control tower", "escalation", "escalations", "intervention",
-        "bottleneck", "bottlenecks", "ops lead", "floor lead",
+        "bottleneck", "bottlenecks", "ops lead", "floor lead", "alerts", "alert",
+        "shortages", "shortage", "supervisor dashboard",
     },
     "planner": {
         "planner", "order planning", "procurement", "release", "planned", "destination", "urgency",
-        "planning", "demand plan",
+        "planning", "demand plan", "prioritize", "ship first", "inventory need",
     },
     "executive": {
         "executive", "dashboard", "kpi", "kpis", "summary", "overview", "warehouse",
         "management", "ceo", "vp", "leadership", "scorecard", "pulse", "snapshot",
-        "how are we", "how is the", "risk", "risks", "warehouse health", "completion rate",
-        "needs attention", "attention", "health",
+        "how are we", "how is the", "how we doing", "risk", "risks", "warehouse health",
+        "completion rate", "needs attention", "attention", "health", "what's going on",
+        "whats going on", "anything wrong", "worried", "ops summary", "operations dashboard",
+        "ops dashboard", "operations summary",
     },
     "ai_analysis": {
         "focus today", "summarize performance", "biggest risk", "top 3 actions",
         "vs yesterday", "versus yesterday", "30 minute", "thirty minute", "review first",
         "below target", "ai analysis", "what should i focus", "first look",
+        "why delays", "why delay", "improve what", "investigate first", "summarize",
+        "today vs yesterday", "kpis below target",
+    },
+    "analytics": {
+        "trend", "trends", "this week", "this month", "weekly", "monthly",
+        "vs yesterday", "compared to yesterday", "analytics", "period",
+    },
+    "natural": {
+        "what's going on", "whats going on", "anything wrong", "worried", "behind",
+        "how we doing", "how are we doing", "healthy", "goals", "fail today",
+        "biggest issue", "going on", "all good", "status check",
     },
     "warehouse_network": {
         "warehouse", "site", "sites", "facility", "facilities", "warehouse network",
         "distribution center", "dc network", "compare warehouse", "compare sites",
-        "which site", "by warehouse", "by site",
+        "which site", "by warehouse", "by site", "warehouse delays",
     },
     "critical": {"critical", "critcal", "critial", "sev1", "p0"},
     "urgent": {"urgent", "sev2", "p1"},
     "standard": {"standard", "normal", "routine"},
-    "blocked": {"blocked", "block", "stuck", "shortage", "shortages", "can't move", "cannot move"},
+    "blocked": {
+        "blocked", "block", "stuck", "shortage", "shortages", "can't move", "cannot move",
+        "blocked by inventory", "waiting inventory",
+    },
     "help": {
         "help", "what can you", "what can ask wms", "explain", "how does", "what does",
         "meaning", "difference between", "what is digitech", "ask wms", "digitech wms",
@@ -112,7 +137,7 @@ CONCEPTS: dict[str, set[str]] = {
     },
     "adjustments": {
         "adjustment", "adjustments", "cycle count", "recount", "inventory correction",
-        "qty change", "adjusted",
+        "qty change", "adjusted", "discrepancy", "discrepancies",
     },
 }
 
@@ -177,6 +202,17 @@ SPELLING_FIXES = {
     "summry": "summary",
     "overveiw": "overview",
     "overivew": "overview",
+    "bottlenecks": "bottleneck",
+    "utilizaton": "utilization",
+    "utilisaton": "utilization",
+    "troughput": "throughput",
+    "thruput": "throughput",
+    "dashbaord": "dashboard",
+    "operatons": "operations",
+    "analysics": "analytics",
+    "tend": "trend",
+    "woried": "worried",
+    "anyting": "anything",
 }
 
 
@@ -251,26 +287,32 @@ def extract_entities(normalized: str, original: str = "", warehouses: list[str] 
     if not sku_match:
         # Only accept bare 4–8 digit tokens when not looking like an order fragment.
         sku_match = re.search(r"(?<![A-Za-z-])\b([0-9]{4,8})\b(?!\s*(?:units?|orders?))", normalized)
-        if sku_match and re.search(r"\bord-", original or "", flags=re.I):
+        if sku_match and re.search(r"\b(?:ord-|dt\d{2}-)", original or normalized or "", flags=re.I):
             sku_match = None
     if sku_match:
         entities["sku"] = sku_match.group(1)
 
-    # DigiTech demo IDs look like ORD-DT82-0081; also support ORD-20260101120000.
+    # DigiTech demo IDs: ORD-DT82-0081, DT82-0036 (ORD- optional), ORD-20260101120000.
+    text_for_order = original or normalized
     order_match = re.search(
-        r"\b(?:order|ord)\s*#?\s*(ORD-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*|\d{3,})\b",
-        original or normalized,
+        r"\b(?:order|ord)\s*#?\s*(ORD-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*|DT\d{2}-\d{3,}|\d{3,})\b",
+        text_for_order,
         flags=re.I,
     )
     if not order_match:
         order_match = re.search(
             r"\b(ORD-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*)\b",
-            original or normalized,
+            text_for_order,
             flags=re.I,
         )
+    if not order_match:
+        # Bare DigiTech demo fragment without ORD- prefix (e.g. DT82-0036 / status DT82-0036).
+        order_match = re.search(r"\b(DT\d{2}-\d{3,})\b", text_for_order, flags=re.I)
     if order_match:
-        raw = order_match.group(1)
-        entities["order_id"] = raw.upper() if str(raw).upper().startswith("ORD-") else raw
+        raw = str(order_match.group(1)).upper()
+        if raw.startswith("DT") and not raw.startswith("ORD-"):
+            raw = f"ORD-{raw}"
+        entities["order_id"] = raw if raw.startswith("ORD-") else order_match.group(1)
 
     if re.search(r"\bcritical\b", normalized):
         entities["urgency"] = "Critical"

@@ -172,6 +172,38 @@ def test_order_dt82_0036_status(conn):
     assert context.get("order_id") == "ORD-DT82-0036"
 
 
+def test_order_dt82_0036_who_picked(conn):
+    html, _, context = _answer(conn, "who picked ORD-DT82-0036")
+    low = html.lower()
+    assert "ord-dt82-0036" in low
+    assert "sophia" in low or "picked" in low
+    assert context.get("order_id") == "ORD-DT82-0036"
+    assert context.get("picker")
+
+
+def test_order_dt82_bare_prefix(conn):
+    html, _, context = _answer(conn, "status DT82-0036")
+    assert "ord-dt82-0036" in html.lower()
+    assert context.get("order_id") == "ORD-DT82-0036"
+
+
+def test_natural_language_anything_wrong(conn):
+    html, _, _ = _answer(conn, "anything wrong?")
+    low = html.lower()
+    assert "order" in low or "warehouse" in low or "sla" in low or "blocked" in low
+
+
+def test_cross_module_phrases(conn):
+    html, _, _ = _answer(conn, "blocked by inventory")
+    assert "bottleneck" in html.lower() or "blocked" in html.lower() or "sla" in html.lower()
+
+
+def test_analytics_period_honest(conn):
+    html, _, _ = _answer(conn, "this week")
+    low = html.lower()
+    assert "not fully supported" in low or "insufficient" in low or "yesterday" in low
+
+
 def test_answer_ask_wms_wrapper(conn):
     html, snap, context = wms.answer_ask_wms(conn, "Which audit failed?")
     assert "ORD-DT82-0081" in html
