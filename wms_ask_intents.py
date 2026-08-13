@@ -974,19 +974,27 @@ def classify_intent(question: str, warehouses: list[str] | None = None, prior_co
             r"\b(show failed|failed audit|list failed|quality history|audits today|today.?s audit|"
             r"list quality|show quality issue|audit history|recent audit)\b",
             normalized,
-        ) or (re.search(r"\bquality issue\b", normalized) and re.search(r"\b(show|list|all)\b", normalized)):
+        ):
             scores["quality_audits_list"] += 20
             scores["quality_summary"] -= 6
+            scores["quality_failed_detail"] -= 4
         elif re.search(
-            r"\b(failed|fail|mistake|discrepanc|carton|crush|damage|which audit|which order.*"
-            r"(quality|inspection|mistake)|why.*(fail|audit)|inspection)\b",
+            r"\b(any quality|open quality|pass rate|quality summary|qc status|quality\?|quality problem)\b",
             normalized,
-        ) or re.search(r"\b(quality issue|order.*mistake|mistake.*order)\b", normalized):
+        ) or normalized in {"quality", "quality issue", "quailty issue"}:
+            scores["quality_summary"] += 18
+            scores["quality_failed_detail"] -= 12
+        elif re.search(
+            r"\b(failed|fail|mistake|discrepanc|carton|crush|damage|which audit|"
+            r"why.*(fail|audit)|failed inspection|order failed)\b",
+            normalized,
+        ) or re.search(
+            r"\b(which order).*(quality|inspection|mistake)\b",
+            normalized,
+        ) or re.search(r"\b(order with the mistake|the mistake)\b", normalized):
             scores["quality_failed_detail"] += 20
             scores["quality_summary"] -= 8
             scores["orders_by_status"] -= 6
-        elif re.search(r"\b(pass rate|quality summary|qc status|any quality|quality\?)\b", normalized):
-            scores["quality_summary"] += 10
 
     # Standalone follow-up-style questions without prior still map to intents (engine asks for context).
     if re.search(r"\b(who picked( it| that)?|which picker)\b", normalized):

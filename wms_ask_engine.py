@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from html import escape as html_escape
 from datetime import timedelta
+import re
 from typing import Any, Callable
 
 import wms_ask_intents as intents
@@ -283,19 +284,27 @@ def answer_question(
         accuracy = queries.inventory_accuracy(conn)
         shipped_today, _ = queries.count_shipped_on_date(conn, now.date())
         created_today = int(queries.count_orders_created_on_date(conn, now.date()) or 0)
+        completion_rate = (
+            round((snapshot["completed"] / snapshot["orders_total"]) * 100, 1)
+            if snapshot["orders_total"]
+            else 0.0
+        )
         headline = (
             f"Current DigiTech WMS KPIs: {snapshot['orders_total']} total order(s), "
-            f"{open_orders} pending/open, {snapshot['completed']} completed."
+            f"{open_orders} pending/open, {snapshot['completed']} completed "
+            f"({completion_rate}% completion rate)."
             if intent == "kpi_snapshot"
             else (
-                f"Warehouse snapshot: {open_orders} open order(s), {snapshot['completed']} completed, "
-                f"{snapshot['blocked']} blocked, inventory value ${snapshot['inventory_value']:,.2f}."
+                f"Warehouse snapshot: {open_orders} open order(s), {snapshot['completed']} completed "
+                f"({completion_rate}% completion), {snapshot['blocked']} blocked, "
+                f"inventory value ${snapshot['inventory_value']:,.2f}."
             )
         )
         bullets = [
             f"Orders received/created today: {created_today}",
             f"Orders shipped/completed today: {shipped_today}",
             f"Orders pending (not completed): {open_orders}",
+            f"Completion rate (session): {completion_rate}%",
             f"Quality audit pass rate: {quality['pass_rate']}% "
             f"({quality['audits_passed']} passed of {quality['audits_total']} audits)",
             f"Inventory accuracy: {accuracy['accuracy_pct']}% "
@@ -617,6 +626,7 @@ def answer_question(
         day = entities.get("date") or now.date()
         label = entities.get("date_label") or "today"
         shipped_today, sample = queries.count_shipped_on_date(conn, day)
+        shipped_yesterday, _ = queries.count_shipped_on_date(conn, day - timedelta(days=1))
         answer = compose_response(
             (
                 f"Shipping pulse: {shipped_today} completed on {label}, "
@@ -626,9 +636,10 @@ def answer_question(
             [
                 f"Ready-ish pre-ship queue = Pending Verification ({snapshot['pending_verification']})",
                 f"Blocked from shipping: {snapshot['blocked']} blocked + {snapshot['quality_issue']} quality issue",
+                f"Volume vs prior day: {shipped_today} vs {shipped_yesterday} (session dates only — limited trend history)",
                 *(["Examples completed: " + ", ".join(sample)] if sample else []),
             ],
-            "Ask how many shipped today or for quality issues delaying shipping.",
+            "Ask how many shipped today, for OTIF, or for quality issues delaying shipping.",
             footer,
         )
         return answer, snapshot, context
@@ -715,6 +726,16 @@ def answer_question(
         return answer, snapshot, context
 
     if intent == "low_stock":
+        normalized = classification.get("normalized") or ""
+        if "overstock" in normalized or "over stock" in normalized:
+            rows = queries.overstock_skus(conn, threshold=500, limit=8)
+            answer = compose_response(
+                f"{len(rows)} SKU(s) at or above the 500-unit overstock threshold.",
+                [f"SKU {r['sku']}: {r['qty']} units" for r in rows] or ["No overstock SKUs at that threshold."],
+                "Ask for low-stock SKUs or inventory value.",
+                footer,
+            )
+            return answer, snapshot, context
         rows = queries.low_stock_skus(conn, threshold=low_stock_threshold, limit=8)
         answer = compose_response(
             f"{len(rows)} SKU(s) are below the {low_stock_threshold}-unit low-stock threshold.",

@@ -256,15 +256,15 @@ def extract_entities(normalized: str, original: str = "", warehouses: list[str] 
     if sku_match:
         entities["sku"] = sku_match.group(1)
 
-    # DigiTech demo IDs look like ORD-DT82-0081 (letters + digits), not only ORD-123.
+    # DigiTech demo IDs look like ORD-DT82-0081; also support ORD-20260101120000.
     order_match = re.search(
-        r"\b(?:order|ord)\s*#?\s*(ORD-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+|\d{3,})\b",
+        r"\b(?:order|ord)\s*#?\s*(ORD-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*|\d{3,})\b",
         original or normalized,
         flags=re.I,
     )
     if not order_match:
         order_match = re.search(
-            r"\b(ORD-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+)\b",
+            r"\b(ORD-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*)\b",
             original or normalized,
             flags=re.I,
         )

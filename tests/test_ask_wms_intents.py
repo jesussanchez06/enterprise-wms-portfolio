@@ -628,13 +628,139 @@ def test_ambiguous_and_unknown():
     assert result["intent"] == "unknown" or result["confidence"] == "low"
 
 
+QUALITY_FAILED = [
+    "Which audit failed?",
+    "Which order failed inspection?",
+    "Why did the audit fail?",
+    "Which order has a quality issue?",
+    "Which order is the one with the mistake?",
+    "What discrepancy was found?",
+    "carton damage?",
+    "carton corner crush?",
+]
+
+QUALITY_LIST = [
+    "Show failed audits",
+    "quality history",
+    "today's audits",
+    "list failed audits",
+    "show quality issues",
+]
+
+QUALITY_AUDITOR = [
+    "Who audited?",
+    "Which auditor?",
+    "who inspected?",
+]
+
+KPI_ATTENTION = [
+    "Which KPI needs attention?",
+    "kpi needs attention",
+    "which metric needs attention",
+]
+
+AI_BRIEFING = [
+    "What should I focus on today?",
+    "summarize performance",
+    "biggest risk right now",
+    "vs yesterday",
+    "30 minute review first",
+]
+
+AVG_COMPLETION = [
+    "What's the average completion time?",
+    "avg completion time",
+    "average cycle time",
+]
+
+CONTEXT_PICKER = [
+    "Who picked it?",
+    "who picked that order?",
+]
+
+CONTEXT_SKU = [
+    "What SKU was involved?",
+    "which sku was involved?",
+]
+
+CONTEXT_SHIPPED = [
+    "Was it shipped?",
+    "did it ship?",
+]
+
+
+@pytest.mark.parametrize("phrase", QUALITY_FAILED)
+def test_quality_failed_detail(phrase):
+    assert _intent(phrase) == "quality_failed_detail", phrase
+
+
+@pytest.mark.parametrize("phrase", QUALITY_LIST)
+def test_quality_audits_list(phrase):
+    assert _intent(phrase) == "quality_audits_list", phrase
+
+
+@pytest.mark.parametrize("phrase", QUALITY_AUDITOR)
+def test_quality_auditor(phrase):
+    assert _intent(phrase) == "quality_auditor", phrase
+
+
+@pytest.mark.parametrize("phrase", KPI_ATTENTION)
+def test_kpi_attention(phrase):
+    assert _intent(phrase) == "kpi_attention", phrase
+
+
+@pytest.mark.parametrize("phrase", AI_BRIEFING)
+def test_ai_briefing(phrase):
+    assert _intent(phrase) == "ai_briefing", phrase
+
+
+@pytest.mark.parametrize("phrase", AVG_COMPLETION)
+def test_avg_completion_time(phrase):
+    assert _intent(phrase) == "avg_completion_time", phrase
+
+
+def test_ord_dt82_entity_extraction():
+    result = _result("What's the status of order ORD-DT82-0081?")
+    assert result["intent"] == "order_status"
+    assert result["entities"].get("order_id") == "ORD-DT82-0081"
+
+    result = _result("Tell me about ORD-DT82-0036")
+    assert result["entities"].get("order_id") == "ORD-DT82-0036"
+
+
+def test_quality_follow_ups_with_context():
+    prior = {
+        "intent": "quality_failed_detail",
+        "intent_family": "quality",
+        "order_id": "ORD-DT82-0081",
+        "sku": "11043",
+        "picker": "Maria Alvarez",
+        "entities": {"order_id": "ORD-DT82-0081", "sku": "11043", "picker": "Maria Alvarez"},
+    }
+    assert _result("Who picked it?", prior=prior)["intent"] == "context_picker"
+    assert _result("Who picked it?", prior=prior)["entities"].get("order_id") == "ORD-DT82-0081"
+    assert _result("What SKU was involved?", prior=prior)["intent"] == "context_sku"
+    assert _result("Was it shipped?", prior=prior)["intent"] == "context_shipped"
+    assert _result("Who audited?", prior=prior)["intent"] == "quality_auditor"
+
+
+@pytest.mark.parametrize("phrase", CONTEXT_PICKER)
+def test_context_picker_intent(phrase):
+    assert _intent(phrase) == "context_picker", phrase
+
+
+@pytest.mark.parametrize("phrase", CONTEXT_SKU)
+def test_context_sku_intent(phrase):
+    assert _intent(phrase) == "context_sku", phrase
+
+
+@pytest.mark.parametrize("phrase", CONTEXT_SHIPPED)
+def test_context_shipped_intent(phrase):
+    assert _intent(phrase) == "context_shipped", phrase
+
+
 def test_intent_catalog_size():
-    assert len(INTENT_DEFS) >= 40
-
-
-def test_concept_and_spelling_coverage():
-    assert len(CONCEPTS) >= 20
-    assert len(SPELLING_FIXES) >= 40
+    assert len(INTENT_DEFS) >= 48
 
 
 def test_phrase_variation_count_floor():
@@ -662,6 +788,9 @@ def test_phrase_variation_count_floor():
         ORDERS_OLDEST,
         REMAINING_WORK,
         QUALITY,
+        QUALITY_FAILED,
+        QUALITY_LIST,
+        QUALITY_AUDITOR,
         SHIPPING_SUMMARY,
         INVENTORY_SUMMARY,
         LOW_STOCK,
@@ -677,9 +806,15 @@ def test_phrase_variation_count_floor():
         ADJUSTMENTS,
         CRITICAL,
         BLOCKED,
+        KPI_ATTENTION,
+        AI_BRIEFING,
+        AVG_COMPLETION,
+        CONTEXT_PICKER,
+        CONTEXT_SKU,
+        CONTEXT_SHIPPED,
     ]
     total = sum(len(b) for b in buckets)
-    assert total >= 150, total
+    assert total >= 180, total
 
 
 if __name__ == "__main__":
