@@ -133,9 +133,20 @@ WAREHOUSE_SUMMARY = [
     "Give me a warehouse summary.",
     "How is the warehouse doing?",
     "Executive summary",
-    "KPI overview",
     "Risks?",
     "Status?",
+]
+
+KPI_SNAPSHOT = [
+    "what are the kpis",
+    "What are the KPIs?",
+    "show me today's KPIs",
+    "give me the important KPIs",
+    "today's kpis",
+    "KPI",
+    "KPIs?",
+    "Show warehouse KPIs",
+    "current KPIs",
 ]
 
 WAREHOUSE_COUNT = [
@@ -368,7 +379,12 @@ def test_picker_count(phrase):
 
 @pytest.mark.parametrize("phrase", WAREHOUSE_SUMMARY)
 def test_warehouse_summary(phrase):
-    assert _intent(phrase) == "warehouse_summary", phrase
+    assert _intent(phrase) == "warehouse_summary"
+
+
+@pytest.mark.parametrize("phrase", KPI_SNAPSHOT)
+def test_kpi_snapshot(phrase):
+    assert _intent(phrase) == "kpi_snapshot", phrase
 
 
 @pytest.mark.parametrize("phrase", WAREHOUSE_COUNT)
@@ -637,6 +653,7 @@ def test_phrase_variation_count_floor():
         TOP_VALUE,
         PICKER_COUNT,
         WAREHOUSE_SUMMARY,
+        KPI_SNAPSHOT,
         WAREHOUSE_COUNT,
         WAREHOUSE_COMPARE,
         ORDERS_OPEN,

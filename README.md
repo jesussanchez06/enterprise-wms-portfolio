@@ -38,15 +38,16 @@ KPIs are never hard-coded in the UI — they are calculated from order, audit, i
 
 ### Persistence model
 
-1. **Master template** — `enterprise_wms_master.db` holds the completed 82-order baseline.
-2. **Visitor isolation** — each browser gets a private clone under `demo_sessions/<session>.db`.
-3. **Reset Demo** — reclones the same 82-order / 0-pending master (never an empty warehouse).
-4. **Cold start / Render** — if the master DB is missing or off-baseline (common on free-tier ephemeral disk), `bootstrap_application()` rebuilds the full completed baseline automatically on process start or first request.
+1. **Master / seed template** — `enterprise_wms_master.db` holds the completed 82-order baseline and is **never modified** by recruiter activity.
+2. **Visitor isolation** — each browser gets a private clone under `demo_sessions/<random-session-id>.db` (UUID hex cookie). Recruiter A and Recruiter B on the same public URL never share orders, inventory, picks, quality, shipping, KPIs, or Ask WMS answers.
+3. **Reset Demo** — deletes/reclones **only** the current visitor’s private DB from the clean seed.
+4. **Cold start / Render** — if the master DB is missing or off-baseline (common on free-tier ephemeral disk), `bootstrap_application()` rebuilds the seed automatically. DigiTech WMS provides isolated temporary demo workspaces. Demo activity may reset after hosting restarts or inactivity.
 5. **Startup never wipes a healthy baseline** — reseeding only runs when the tagged 82-order completed set is absent.
+6. **Session cleanup** — inactive visitor DBs older than 24 hours (configurable via `WMS_DEMO_SESSION_TTL_HOURS`) are removed safely; the seed is never deleted.
 
-### Render disk caveat
+### Render / secret configuration
 
-On Render’s free tier, the filesystem is ephemeral. After a deploy or idle spin-down the SQLite files may disappear. DigiTech WMS treats that as a cold start and **re-seeds the 82-order completed baseline** so recruiters still see live KPIs. For longer-lived state, attach a persistent disk or external DB later; the demo does not require it.
+Set `WMS_SECRET_KEY` in the Render environment so Flask session cookies stay stable across requests within a deploy. Do not commit production secrets to GitHub.
 
 ## Ask WMS
 
@@ -74,7 +75,7 @@ Ask WMS is read-only: natural-language questions cannot create orders, adjust in
 - Operations / picking backlog
 - Quality pass rate and open issues
 - Supervisor recommended actions
-- Planner destination / urgency mix
+- Order Planning destination / urgency mix
 - Help / workflow explanations
 
 ## Local demo

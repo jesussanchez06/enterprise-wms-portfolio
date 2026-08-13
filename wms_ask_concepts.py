@@ -26,7 +26,9 @@ CONCEPTS: dict[str, set[str]] = {
     "quality": {
         "quality", "qc", "audit", "audits", "inspection", "verification", "discrepancy",
         "defect", "damage", "accuracy", "qa", "pass rate", "failed audit", "escalation",
-        "escalations",
+        "escalations", "failed", "fail", "failed inspection", "mistake", "carton",
+        "crush", "auditor", "audited", "inspector", "quality issue", "quality history",
+        "re-audit", "reaudit",
     },
     "sla": {
         "sla", "deadline", "due", "late", "overdue", "at risk", "atrisk", "breached",
@@ -49,7 +51,8 @@ CONCEPTS: dict[str, set[str]] = {
     },
     "picking": {
         "pick", "picking", "picker", "pickers", "picked", "fulfillment", "workboard",
-        "work queue", "ready to pick", "pick queue",
+        "work queue", "ready to pick", "pick queue", "who picked", "who is picking",
+        "active picker", "most orders",
     },
     "capacity": {
         "capacity", "backlog", "queue", "remaining work", "work remaining",
@@ -60,13 +63,19 @@ CONCEPTS: dict[str, set[str]] = {
         "bottleneck", "bottlenecks", "ops lead", "floor lead",
     },
     "planner": {
-        "planner", "procurement", "release", "planned", "destination", "urgency",
+        "planner", "order planning", "procurement", "release", "planned", "destination", "urgency",
         "planning", "demand plan",
     },
     "executive": {
         "executive", "dashboard", "kpi", "kpis", "summary", "overview", "warehouse",
         "management", "ceo", "vp", "leadership", "scorecard", "pulse", "snapshot",
-        "how are we", "how is the", "risk", "risks",
+        "how are we", "how is the", "risk", "risks", "warehouse health", "completion rate",
+        "needs attention", "attention", "health",
+    },
+    "ai_analysis": {
+        "focus today", "summarize performance", "biggest risk", "top 3 actions",
+        "vs yesterday", "versus yesterday", "30 minute", "thirty minute", "review first",
+        "below target", "ai analysis", "what should i focus", "first look",
     },
     "warehouse_network": {
         "warehouse", "site", "sites", "facility", "facilities", "warehouse network",
@@ -247,13 +256,18 @@ def extract_entities(normalized: str, original: str = "", warehouses: list[str] 
     if sku_match:
         entities["sku"] = sku_match.group(1)
 
+    # DigiTech demo IDs look like ORD-DT82-0081 (letters + digits), not only ORD-123.
     order_match = re.search(
-        r"\b(?:order|ord)\s*#?\s*(ORD-\d+|\d{3,})\b",
+        r"\b(?:order|ord)\s*#?\s*(ORD-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+|\d{3,})\b",
         original or normalized,
         flags=re.I,
     )
     if not order_match:
-        order_match = re.search(r"\b(ORD-\d+)\b", original or normalized, flags=re.I)
+        order_match = re.search(
+            r"\b(ORD-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+)\b",
+            original or normalized,
+            flags=re.I,
+        )
     if order_match:
         raw = order_match.group(1)
         entities["order_id"] = raw.upper() if str(raw).upper().startswith("ORD-") else raw

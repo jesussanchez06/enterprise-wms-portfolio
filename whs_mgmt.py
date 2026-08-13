@@ -16,6 +16,7 @@ import subprocess
 import time
 import signal
 import re
+import secrets
 from urllib.parse import urlencode
 from html import escape as html_escape
 from werkzeug.utils import secure_filename
@@ -33,6 +34,13 @@ LEGACY_DB = os.path.join(BASE_DIR, "enterprise_wms.db")
 SESSION_DB_DIR = os.path.join(BASE_DIR, "demo_sessions")
 # Backward-compatible alias used by older call sites / docs.
 DB = MASTER_DB
+SESSION_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+DEMO_SESSION_TTL_SECONDS = int(os.environ.get("WMS_DEMO_SESSION_TTL_HOURS", "24")) * 3600
+_DEMO_CLEANUP_COUNTER = 0
+
+
+class DemoWorkspaceError(RuntimeError):
+    """Raised when a private visitor workspace cannot be created or resolved."""
 
 
 def ensure_session_db_dir():
@@ -80,6 +88,39 @@ def purge_demo_session_databases():
     return removed
 
 
+def cleanup_stale_demo_sessions(ttl_seconds=None, force=False):
+    """Remove inactive visitor DBs older than TTL. Never deletes the master seed."""
+    global _DEMO_CLEANUP_COUNTER
+    ttl = DEMO_SESSION_TTL_SECONDS if ttl_seconds is None else int(ttl_seconds)
+    _DEMO_CLEANUP_COUNTER += 1
+    # Probabilistic / periodic: every ~40th request, or when forced.
+    if not force and (_DEMO_CLEANUP_COUNTER % 40) != 0:
+        return 0
+    ensure_session_db_dir()
+    now = time.time()
+    removed = 0
+    active_id = None
+    try:
+        if has_request_context():
+            active_id = session.get("demo_session_id")
+    except Exception:
+        active_id = None
+    for name in os.listdir(SESSION_DB_DIR):
+        if not name.endswith(".db"):
+            continue
+        session_key = name[:-3]
+        if active_id and session_key == active_id:
+            continue
+        path = os.path.join(SESSION_DB_DIR, name)
+        try:
+            age = now - os.path.getmtime(path)
+        except OSError:
+            continue
+        if age >= ttl:
+            removed += _remove_sqlite_file(path)
+    return removed
+
+
 def sqlite_order_count(db_path):
     if not db_path or not os.path.exists(db_path):
         return 0
@@ -103,18 +144,38 @@ def db_has_demo_baseline(db_path):
     try:
         from wms_demo_seed import demo_baseline_present
 
-        conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10, check_same_thread=False)
         try:
             return bool(demo_baseline_present(conn))
         finally:
             conn.close()
     except Exception:
+        try:
+            conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+            try:
+                from wms_demo_seed import demo_baseline_present
+
+                return bool(demo_baseline_present(conn))
+            finally:
+                conn.close()
+        except Exception:
+            return False
+
+
+def validate_demo_session_id(session_id):
+    """Only allow opaque hex IDs so cookies cannot path-traverse to other DBs."""
+    if not session_id or not isinstance(session_id, str):
         return False
+    if not SESSION_ID_RE.fullmatch(session_id):
+        return False
+    if ".." in session_id or "/" in session_id or "\\" in session_id:
+        return False
+    return True
 
 
 def get_demo_session_id():
     session_id = session.get("demo_session_id")
-    if not session_id:
+    if not validate_demo_session_id(session_id):
         session_id = uuid4().hex
         session["demo_session_id"] = session_id
     session.permanent = True
@@ -124,19 +185,38 @@ def get_demo_session_id():
 def session_db_path(session_id=None):
     ensure_session_db_dir()
     resolved_id = session_id or get_demo_session_id()
-    return os.path.join(SESSION_DB_DIR, f"{resolved_id}.db")
+    if not validate_demo_session_id(resolved_id):
+        raise DemoWorkspaceError("Invalid demo session identifier.")
+    # Resolve under SESSION_DB_DIR only (prevents path escape).
+    path = os.path.abspath(os.path.join(SESSION_DB_DIR, f"{resolved_id}.db"))
+    root = os.path.abspath(SESSION_DB_DIR)
+    if os.path.commonpath([root, path]) != root:
+        raise DemoWorkspaceError("Invalid demo session path.")
+    return path
+
+
+def touch_session_db(path):
+    try:
+        if path and os.path.exists(path):
+            os.utime(path, None)
+    except OSError:
+        pass
 
 
 def clone_master_database(dest_path):
+    """Copy the read-only master seed into a private visitor SQLite file."""
     ensure_session_db_dir()
     parent = os.path.dirname(dest_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
     if not os.path.exists(MASTER_DB):
-        # Master will be created by init_db/startup; create empty file as fallback.
-        open(MASTER_DB, "a").close()
+        raise DemoWorkspaceError("Demo seed database is missing.")
 
-    source = sqlite3.connect(MASTER_DB, timeout=10, check_same_thread=False)
+    # Prefer read-only open of the seed so visitor cloning cannot mutate it.
+    try:
+        source = sqlite3.connect(f"file:{MASTER_DB}?mode=ro", uri=True, timeout=10, check_same_thread=False)
+    except sqlite3.Error:
+        source = sqlite3.connect(MASTER_DB, timeout=10, check_same_thread=False)
     try:
         destination = sqlite3.connect(dest_path, timeout=10, check_same_thread=False)
         try:
@@ -147,37 +227,68 @@ def clone_master_database(dest_path):
     finally:
         source.close()
 
+    if not os.path.exists(dest_path) or sqlite_order_count(dest_path) <= 0:
+        _remove_sqlite_file(dest_path)
+        raise DemoWorkspaceError("Private demo workspace could not be initialized from the seed.")
+
+
+def visitor_db_needs_reclone(path):
+    """Reclone only missing/empty/corrupt files — never wipe an active recruiter workspace."""
+    if not path or not os.path.exists(path):
+        return True
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return True
+    if size < 1024:
+        return True
+    # Empty warehouse = broken clone; active workspaces (even if modified) stay put.
+    return sqlite_order_count(path) <= 0
+
 
 def ensure_visitor_session_db(force_reset=False):
-    """Clone the shared master seed into an isolated per-visitor SQLite file.
+    """Ensure this browser has a private SQLite clone. Never falls back to the shared seed for writes."""
+    if not has_request_context():
+        raise DemoWorkspaceError("Visitor database requires an HTTP request context.")
 
-    Aggressively reclones when this browser still has a pre-82-order stale DB.
-    """
     path = session_db_path()
-    stale_session = False
-    if os.path.exists(path) and not force_reset:
-        # Cookie still points at an old clone (0–2 orders) while master has the
-        # recruiter baseline — heal automatically so the dashboard updates without
-        # requiring a manual Reset Demo hunt.
-        if db_has_demo_baseline(MASTER_DB) and not db_has_demo_baseline(path):
-            stale_session = True
-            force_reset = True
-
     if force_reset and os.path.exists(path):
         _remove_sqlite_file(path)
 
-    if not os.path.exists(path):
+    if visitor_db_needs_reclone(path) or force_reset:
+        if os.path.exists(path):
+            _remove_sqlite_file(path)
         if not db_has_demo_baseline(MASTER_DB):
-            # Last-resort heal: rebuild master before cloning into a visitor session.
+            # Rebuild seed only — visitors never write the seed during normal ops.
             ensure_bootstrap_demo_data(force_orders=True)
-        clone_master_database(path)
-        if stale_session:
-            debug_log(
-                "system.reclone_stale_demo_session",
-                session_id=session.get("demo_session_id", ""),
-                orders=sqlite_order_count(path),
-            )
+        if not os.path.exists(MASTER_DB):
+            raise DemoWorkspaceError("Demo seed database is missing.")
+        try:
+            clone_master_database(path)
+        except DemoWorkspaceError:
+            raise
+        except Exception as exc:
+            _remove_sqlite_file(path)
+            raise DemoWorkspaceError(
+                "Your private demo workspace could not be initialized. Please refresh and try again."
+            ) from exc
+
+    if not os.path.exists(path):
+        raise DemoWorkspaceError(
+            "Your private demo workspace could not be initialized. Please refresh and try again."
+        )
+
+    # Absolute safety: never allow resolving the master path as a visitor DB.
+    if os.path.abspath(path) == os.path.abspath(MASTER_DB):
+        raise DemoWorkspaceError("Refusing to bind visitor traffic to the shared seed database.")
+
+    touch_session_db(path)
     return path
+
+
+def get_current_demo_db():
+    """Public helper: absolute path to the current visitor's private SQLite DB."""
+    return ensure_visitor_session_db()
 
 
 def resolve_db_path(use_master=False):
@@ -185,19 +296,23 @@ def resolve_db_path(use_master=False):
         return MASTER_DB
     if has_request_context():
         return ensure_visitor_session_db()
+    # Outside requests (CLI/bootstrap only) — never used by HTTP handlers.
     return MASTER_DB
 
 
 # helper to centralize connection settings (timeout + thread sharing)
 def get_conn(use_master=False):
     db_path = resolve_db_path(use_master=use_master)
+    if (not use_master) and has_request_context():
+        if os.path.abspath(db_path) == os.path.abspath(MASTER_DB):
+            raise DemoWorkspaceError("Refusing shared-seed connection for visitor request.")
     conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
     ensure_runtime_schema(conn)
     return conn
 
 
 def reset_visitor_demo_data():
-    """Restore this browser visitor to the original sample warehouse baseline."""
+    """Restore ONLY this browser visitor from the clean master seed."""
     # Ensure shared master is the 82-order baseline before recloning.
     ensure_bootstrap_demo_data(force_orders=False)
     if not db_has_demo_baseline(MASTER_DB):
@@ -740,6 +855,81 @@ def build_operations_redirect_url(picker, message="", message_type="success"):
         params["ops_message"] = message
         params["ops_message_type"] = "warning" if message_type == "warning" else "success"
     return f"/operations?{urlencode(params)}"
+
+
+def apply_operations_worklist_filters(
+    items,
+    *,
+    search="",
+    status="",
+    urgency="",
+    assigned_picker="",
+    warehouse="",
+):
+    """Filter Operations worklist cards (visitor DB data already loaded). KPI tiles stay unfiltered."""
+    search_text = clean_display_text(search, "").strip().lower()
+    status_key = clean_display_text(status, "").strip().lower()
+    urgency_key = normalize_urgency(urgency, "") if clean_display_text(urgency, "") else ""
+    picker_key = clean_display_text(assigned_picker, "").strip().lower()
+    warehouse_key = canonicalize_warehouse_name(warehouse, "") if clean_display_text(warehouse, "") else ""
+    if warehouse_key and warehouse_key not in WAREHOUSE_NETWORK:
+        warehouse_key = ""
+
+    filtered = []
+    for card in items:
+        if urgency_key and card.get("priority_label") != urgency_key:
+            continue
+
+        if warehouse_key:
+            card_warehouse = canonicalize_warehouse_name(card.get("source_warehouse", ""), "")
+            if card_warehouse != warehouse_key:
+                continue
+
+        if picker_key:
+            card_picker = clean_display_text(card.get("assigned_picker", ""), "").strip().lower()
+            if not card_picker or card_picker != picker_key:
+                continue
+
+        if status_key:
+            stage_key = card.get("stage_key", "")
+            status_label = clean_display_text(card.get("status_label", ""), "")
+            raw_status = clean_display_text(card.get("raw_status", ""), "")
+            if status_key in {"ready", "orders placed"}:
+                if stage_key != "ready":
+                    continue
+            elif status_key in {"picking", "in_progress", "picking in progress"}:
+                if stage_key != "in_progress":
+                    continue
+            elif status_key in {"pending verification", "pending_verification"}:
+                if stage_key != "completed" or status_label != "Pending Verification":
+                    continue
+            elif status_key == "completed":
+                if stage_key != "completed" or status_label != "Completed":
+                    continue
+            elif status_key in {"quality issue", "quality_issue"}:
+                if stage_key != "completed" or status_label != "Quality Issue":
+                    continue
+            elif status_key == "blocked":
+                # Blocked shortage orders live in the alert panel, not the worklist.
+                continue
+            elif status_key not in {stage_key, status_label.lower(), raw_status.lower()}:
+                continue
+
+        if search_text:
+            sku_blob = " ".join(card.get("sku_list") or []).lower()
+            haystack = " ".join(
+                [
+                    clean_display_text(card.get("order_number"), ""),
+                    clean_display_text(card.get("picker_display"), ""),
+                    clean_display_text(card.get("assigned_picker"), ""),
+                    sku_blob,
+                ]
+            ).lower()
+            if search_text not in haystack:
+                continue
+
+        filtered.append(card)
+    return filtered
 
 
 def build_pick_screen_url(order_number, picker, message="", message_type="success"):
@@ -2973,8 +3163,15 @@ def bootstrap_application(force_orders: bool = False, purge_sessions: bool = Fal
 
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("WMS_SECRET_KEY", "enterprise-wms-linkedin-demo-secret")
+# Production: set WMS_SECRET_KEY in the host environment. Never commit real secrets.
+_secret = os.environ.get("WMS_SECRET_KEY", "").strip()
+if not _secret:
+    # Ephemeral fallback for local/dev only — sessions reset when the process restarts.
+    _secret = secrets.token_hex(32)
+app.secret_key = _secret
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=14)
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 EXCEL_FILE = os.path.join(BASE_DIR, "WHS Management.xlsx")
 
 
@@ -2986,8 +3183,33 @@ def bind_isolated_demo_session():
     # gunicorn/Render never hit __main__; bootstrap on first request if needed.
     if not _APP_BOOTSTRAPPED:
         bootstrap_application()
-    ensure_visitor_session_db()
+    try:
+        ensure_visitor_session_db()
+        cleanup_stale_demo_sessions()
+    except DemoWorkspaceError as exc:
+        return (
+            f"""<!doctype html><html><head><title>Demo Workspace</title></head>
+<body style="font-family:Segoe UI,sans-serif;max-width:640px;margin:48px auto;padding:0 16px;">
+<h1>Private demo workspace unavailable</h1>
+<p>{html_escape(str(exc))}</p>
+<p><a href="/">Refresh and try again</a></p>
+</body></html>""",
+            503,
+        )
     return None
+
+
+@app.errorhandler(DemoWorkspaceError)
+def handle_demo_workspace_error(exc):
+    return (
+        f"""<!doctype html><html><head><title>Demo Workspace</title></head>
+<body style="font-family:Segoe UI,sans-serif;max-width:640px;margin:48px auto;padding:0 16px;">
+<h1>Private demo workspace unavailable</h1>
+<p>{html_escape(str(exc))}</p>
+<p><a href="/">Refresh and try again</a></p>
+</body></html>""",
+        503,
+    )
 
 # ======================================================
 # DATABASE INITIALIZATION
@@ -5205,20 +5427,20 @@ def layout(content, body_class=""):
         <span class="nav-brand">DigiTech WMS</span>
         <div class="nav-links">
             <a href="/executive">Warehouse Executive Dashboard</a>
-            <a href="/planner">Planner</a>
+            <a href="/planner">Order Planning</a>
             <a href="/inventory">Inventory</a>
             <a href="/operations">Operations</a>
             <a href="/quality">Quality</a>
             <a href="/supervisor">Supervisor</a>
             <a href="/ask-wms">Ask WMS</a>
-            <form class="nav-reset-form" method="post" action="/reset-demo" onsubmit="return confirm('Reset this demo session to the original sample warehouse data? Your orders, picks, and adjustments in this browser will be cleared.');">
+            <form class="nav-reset-form" method="post" action="/reset-demo" onsubmit="return confirm('Reset your private demo workspace to the original sample warehouse? Only your browser session will be cleared.');">
                 <button class="nav-reset-btn" type="submit">Reset Demo</button>
             </form>
         </div>
     </div>
 
     <div class="container">
-    <p class="demo-session-note">Private demo session &mdash; your warehouse actions stay in this browser only. Use Reset Demo anytime to restore the shared 82-order completed baseline (0 pending).</p>
+    <p class="demo-session-note"><strong>Private Demo Session</strong> &mdash; your changes are isolated to this browser session. Other recruiters on the same link start from a separate copy of the shared baseline.</p>
     """
     html += content
     html += """
@@ -5890,7 +6112,7 @@ def _answer_ask_wms_legacy(conn, question):
                     f"SKU {sku_value} ({description}) cannot support {requested_qty} unit(s). "
                     f"Only {available} unit(s) are available at {SOURCE_WAREHOUSE}."
                 )
-            follow = "Open Planner to place an order within available quantity."
+            follow = "Open Order Planning to place an order within available quantity."
         else:
             headline = (
                 f"SKU {sku_value} ({description}) has {available} part(s)/unit(s) left at {SOURCE_WAREHOUSE}."
@@ -6238,7 +6460,7 @@ def _answer_ask_wms_legacy(conn, question):
         )
         urgency_rows = c.fetchall()
         return compose_ask_response(
-            f"Planner queue holds {snapshot['orders_total']} order(s) in this demo session "
+            f"Order Planning queue holds {snapshot['orders_total']} order(s) in this demo session "
             f"({snapshot['orders_placed']} currently in Orders Placed).",
             [
                 "Destinations: "
@@ -6726,10 +6948,10 @@ def planner():
                 <div class="card">
                     <div class="flash-warning">
                         <h2 style="margin-top:0;">Insufficient Inventory</h2>
-                        <p>Planner cannot place this order because one or more SKUs exceed available on-hand quantity at {source}.</p>
+                        <p>Order Planning cannot place this order because one or more SKUs exceed available on-hand quantity at {source}.</p>
                         <ul>{shortfall_rows}</ul>
                     </div>
-                    <a href="/planner">Go Back to Planner</a>
+                    <a href="/planner">Go Back to Order Planning</a>
                 </div>
             """)
 
@@ -6923,7 +7145,7 @@ def planner():
         <section class='card planner-dashboard-header'>
             <div class='planner-header-top'>
                 <div class='planner-header-copy'>
-                    <div class='page-eyebrow'>&#9672; Planner Dashboard</div>
+                    <div class='page-eyebrow'>&#9672; Order Planning Dashboard</div>
                     <h2>Create Order</h2>
                     <p class='section-note'>Compact order entry with pricing visibility for planning only. Orders cannot exceed available source-warehouse inventory. The live queue remains fixed in view below.</p>
                 </div>
@@ -6982,7 +7204,7 @@ def planner():
                         <div class='planner-total-label'>Estimated Extended Total</div>
                         <div id='planner-order-total' class='planner-total-value'>$0.00</div>
                     </div>
-                    <div class='planner-total-note'>Pricing and totals remain exclusive to Planner and are hidden from Operations pick views.</div>
+                    <div class='planner-total-note'>Pricing and totals remain exclusive to Order Planning and are hidden from Operations pick views.</div>
                 </div>
 
                 <div class='planner-create-actions'>
@@ -7280,18 +7502,81 @@ OPERATIONS_WORKBOARD_TEMPLATE = """
         <div class='ops-stream-stats'>
             <div class='ops-stream-stat in-progress'>
                 <span>Picking Now</span>
-                <strong>{{ in_progress_count }}</strong>
+                <strong>{{ filtered_in_progress_count }}</strong>
             </div>
             <div class='ops-stream-stat ready'>
                 <span>Ready Next</span>
-                <strong>{{ ready_count }}</strong>
+                <strong>{{ filtered_ready_count }}</strong>
             </div>
             <div class='ops-stream-stat completed'>
                 <span>Completed / Sent Forward</span>
-                <strong>{{ completed_lane_count }}</strong>
+                <strong>{{ filtered_completed_count }}</strong>
             </div>
         </div>
     </div>
+
+    <div class='filter-panel' style='margin:18px 0 8px;padding:0;box-shadow:none;border:none;background:transparent;'>
+        <div class='filter-panel-header' style='margin-bottom:12px;'>
+            <div>
+                <div class='section-note' style='text-transform:uppercase;letter-spacing:0.06em;font-weight:700;'>Search &amp; Filters</div>
+                <div class='section-note'>Showing {{ workboard_items|length }} of {{ workboard_total_count }} worklist order(s).</div>
+            </div>
+            <a class='quick-link' href='{{ clear_filters_url }}'>Clear Filters</a>
+        </div>
+        <form method='get'>
+            <input type='hidden' name='picker' value='{{ current_picker }}'>
+            <div class='filter-grid' style='grid-template-columns:repeat(auto-fit, minmax(180px, 1fr));'>
+                <div class='filter-field'>
+                    <label class='filter-label' for='ops-search'>Search</label>
+                    <input id='ops-search' type='text' name='q' value='{{ filter_q }}' placeholder='Order, SKU, or picker'>
+                </div>
+                <div class='filter-field'>
+                    <label class='filter-label' for='ops-status'>Status</label>
+                    <select id='ops-status' name='status'>
+                        <option value='' {% if not filter_status %}selected{% endif %}>All</option>
+                        <option value='ready' {% if filter_status == 'ready' %}selected{% endif %}>Ready</option>
+                        <option value='picking' {% if filter_status == 'picking' %}selected{% endif %}>Picking</option>
+                        <option value='Pending Verification' {% if filter_status == 'Pending Verification' %}selected{% endif %}>Pending Verification</option>
+                        <option value='Completed' {% if filter_status == 'Completed' %}selected{% endif %}>Completed</option>
+                        <option value='Quality Issue' {% if filter_status == 'Quality Issue' %}selected{% endif %}>Quality Issue</option>
+                        <option value='Blocked' {% if filter_status == 'Blocked' %}selected{% endif %}>Blocked</option>
+                    </select>
+                </div>
+                <div class='filter-field'>
+                    <label class='filter-label' for='ops-urgency'>Priority</label>
+                    <select id='ops-urgency' name='urgency'>
+                        <option value='' {% if not filter_urgency %}selected{% endif %}>All</option>
+                        <option value='Critical' {% if filter_urgency == 'Critical' %}selected{% endif %}>Critical</option>
+                        <option value='Urgent' {% if filter_urgency == 'Urgent' %}selected{% endif %}>Urgent</option>
+                        <option value='Standard' {% if filter_urgency == 'Standard' %}selected{% endif %}>Standard</option>
+                    </select>
+                </div>
+                <div class='filter-field'>
+                    <label class='filter-label' for='ops-assigned-picker'>Picker</label>
+                    <select id='ops-assigned-picker' name='assigned_picker'>
+                        <option value='' {% if not filter_assigned_picker %}selected{% endif %}>All</option>
+                        {% for name in picker_roster %}
+                        <option value='{{ name }}' {% if filter_assigned_picker == name %}selected{% endif %}>{{ name }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class='filter-field'>
+                    <label class='filter-label' for='ops-warehouse'>Warehouse</label>
+                    <select id='ops-warehouse' name='warehouse'>
+                        <option value='' {% if not filter_warehouse %}selected{% endif %}>All</option>
+                        {% for name in warehouse_options %}
+                        <option value='{{ name }}' {% if filter_warehouse == name %}selected{% endif %}>{{ name }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+            </div>
+            <div class='filter-foot'>
+                <div class='section-note'>Filters apply to the worklist only. Workboard KPIs stay unfiltered.</div>
+                <button type='submit'>Apply Filters</button>
+            </div>
+        </form>
+    </div>
+
     <div class='ops-stream-list'>
         {% if workboard_items %}
             {% for card in workboard_items %}
@@ -7426,8 +7711,13 @@ OPERATIONS_WORKBOARD_TEMPLATE = """
             {% endfor %}
         {% else %}
         <div class='ops-empty-state'>
+            {% if filters_active %}
+            <b>No orders match the current filters.</b>
+            <div style='margin-top:6px;'>Try clearing filters or adjusting search, status, priority, picker, or warehouse.</div>
+            {% else %}
             <b>No operational work is currently visible.</b>
             <div style='margin-top:6px;'>Released orders, active picks, and recent completions will appear here automatically.</div>
+            {% endif %}
         </div>
         {% endif %}
     </div>
@@ -7440,6 +7730,21 @@ def operations():
     current_picker = resolve_picker_identity(request.args.get("picker"))
     ops_message = request.args.get("ops_message", "").strip()
     ops_message_type = "warning" if request.args.get("ops_message_type", "success").strip() == "warning" else "success"
+
+    filter_q = request.args.get("q", "").strip()
+    filter_status = request.args.get("status", "").strip()
+    filter_urgency_raw = request.args.get("urgency", "").strip()
+    filter_urgency = normalize_urgency(filter_urgency_raw, "") if filter_urgency_raw else ""
+    filter_assigned_picker = request.args.get("assigned_picker", "").strip()
+    if filter_assigned_picker and filter_assigned_picker not in PICKER_ROSTER:
+        filter_assigned_picker = ""
+    filter_warehouse_raw = request.args.get("warehouse", "").strip()
+    filter_warehouse = canonicalize_warehouse_name(filter_warehouse_raw, "") if filter_warehouse_raw else ""
+    if filter_warehouse and filter_warehouse not in WAREHOUSE_NETWORK:
+        filter_warehouse = ""
+    filters_active = bool(
+        filter_q or filter_status or filter_urgency or filter_assigned_picker or filter_warehouse
+    )
 
     conn = get_conn()
     shortage_sync = sync_shortage_order_workflow(conn)
@@ -7600,6 +7905,11 @@ def operations():
             "progress_label": f"{progress_pct}%",
             "detail_rows": detail_rows,
             "hidden_item_count": hidden_item_count,
+            "sku_list": [sku for sku, _qty in readiness.get("expected_lines", [])],
+            "source_warehouse": source_wh,
+            "raw_status": status,
+            "assigned_picker": "",
+            "picker_display": "Needs Assignment",
             "summary": f"{urgency} priority order ready for the next available picker.",
         })
 
@@ -7646,7 +7956,7 @@ def operations():
                 "breached": "SLA Breached",
             }[sla_key],
             "picker_display": picker_display,
-            "assigned_picker": assigned_picker,
+            "assigned_picker": assigned_picker if not is_generic_picker_identity(assigned_picker) else "",
             "can_take_over": can_take_over,
             "started_display": started_display,
             "time_remaining_display": sla_timer,
@@ -7660,6 +7970,9 @@ def operations():
             "remaining_lines_label": f"{readiness_summary['remaining_lines']} SKU(s)",
             "detail_rows": detail_rows,
             "hidden_item_count": hidden_item_count,
+            "sku_list": [sku for sku, _qty in pick_readiness.get("expected_lines", [])],
+            "source_warehouse": source_wh,
+            "raw_status": status,
             "take_over_note": f"Take ownership from {picker_display} and keep working this order.",
             "pick_screen_note": "Open the live pick screen to verify location, enter the quantity you picked, and post the actual transaction yourself.",
             "auto_complete_note": (
@@ -7681,7 +7994,11 @@ def operations():
     for order_number, urgency, status, date_str, picker_name, source_wh, completed_at in completed_orders_raw:
         urgency = normalize_urgency(urgency, "Standard")
         completed_display = format_pt_timestamp(completed_at or date_str)
+        readiness = get_order_pick_readiness(conn, order_number)
         detail_rows, hidden_item_count = get_order_workboard_lines(conn, order_number, source_wh)
+        assigned_picker = clean_display_text(picker_name, "")
+        if is_generic_picker_identity(assigned_picker):
+            assigned_picker = ""
         if status == "Completed":
             status_label = "Completed"
         elif status == "Quality Issue":
@@ -7699,9 +8016,13 @@ def operations():
             "priority_label": urgency,
             "priority_class": f"priority-{urgency.lower().replace(' ', '-')}",
             "picker_display": format_picker_display_name(picker_name),
+            "assigned_picker": assigned_picker,
             "completed_display": completed_display,
             "detail_rows": detail_rows,
             "hidden_item_count": hidden_item_count,
+            "sku_list": [sku for sku, _qty in readiness.get("expected_lines", [])],
+            "source_warehouse": source_wh,
+            "raw_status": status,
             "status_label": status_label,
             "completed_scope_label": f"{sum(item['required_qty'] for item in detail_rows)} unit(s) shown",
             "summary": (
@@ -7716,13 +8037,28 @@ def operations():
         })
 
     completed_lane_count = len(completed_orders)
-    workboard_items = active_orders + ready_orders + completed_orders
+    workboard_items_all = active_orders + ready_orders + completed_orders
+    workboard_total_count = len(workboard_items_all)
+    workboard_items = apply_operations_worklist_filters(
+        workboard_items_all,
+        search=filter_q,
+        status=filter_status,
+        urgency=filter_urgency,
+        assigned_picker=filter_assigned_picker,
+        warehouse=filter_warehouse,
+    )
+    filtered_ready_count = sum(1 for card in workboard_items if card.get("stage_key") == "ready")
+    filtered_in_progress_count = sum(1 for card in workboard_items if card.get("stage_key") == "in_progress")
+    filtered_completed_count = sum(1 for card in workboard_items if card.get("stage_key") == "completed")
 
     conn.close()
+    clear_filters_url = f"/operations?{urlencode({'picker': current_picker})}"
     content = render_template_string(
         OPERATIONS_WORKBOARD_TEMPLATE,
         current_picker=current_picker,
         picker_roster=PICKER_ROSTER,
+        warehouse_options=WAREHOUSE_NETWORK,
+        clear_filters_url=clear_filters_url,
         ops_message=ops_message,
         ops_message_type=ops_message_type,
         shortage_alerts=[
@@ -7740,10 +8076,20 @@ def operations():
             for alert in active_shortage_alerts
         ],
         workboard_items=workboard_items,
+        workboard_total_count=workboard_total_count,
+        filters_active=filters_active,
+        filter_q=filter_q,
+        filter_status=filter_status,
+        filter_urgency=filter_urgency,
+        filter_assigned_picker=filter_assigned_picker,
+        filter_warehouse=filter_warehouse,
         ready_count=ready_count,
         in_progress_count=in_progress_count,
         completed_count=completed_count,
         completed_lane_count=completed_lane_count,
+        filtered_ready_count=filtered_ready_count,
+        filtered_in_progress_count=filtered_in_progress_count,
+        filtered_completed_count=filtered_completed_count,
         shortage_count=len(shortage_alerts),
     )
     return layout(content)
@@ -10083,7 +10429,7 @@ def order_detail(order):
         """
     else:
         quick_links_html = """
-            <a class='quick-link' href='/planner'>Planner</a>
+            <a class='quick-link' href='/planner'>Order Planning</a>
             <a class='quick-link' href='/operations'>Operations</a>
             <a class='quick-link' href='/quality'>Quality</a>
             <a class='quick-link' href='/supervisor'>Supervisor</a>
@@ -11721,7 +12067,7 @@ def executive_dashboard():
         <p style='color:var(--ink-500);font-size:15px;margin:0;'>
             Live operational overview &mdash; {format_executive_timestamp(now)}
         </p>
-        {f"<div class='demo-session-note' style='margin-top:14px;background:#ecfdf5;border-color:#86efac;color:#166534;'>Demo session restored to the original sample warehouse baseline.</div>" if request.args.get('demo_reset') == '1' else ''}
+        {f"<div class='demo-session-note' style='margin-top:14px;background:#ecfdf5;border-color:#86efac;color:#166534;'>Your private demo workspace has been reset.</div>" if request.args.get('demo_reset') == '1' else ''}
         <div class='exec-section-switcher'>
             <button type='button' class='exec-switch-btn active' data-target='overview'>Overview</button>
             <button type='button' class='exec-switch-btn' data-target='productivity'>Productivity</button>
@@ -12171,7 +12517,7 @@ def executive_dashboard():
         <h3 style='margin-bottom:12px;'>Navigate to Operational Modules</h3>
         <div class='quick-links'>
             <a class='quick-link' href='/executive?view=overview'>&#9672; Executive Overview</a>
-            <a class='quick-link' href='/planner'>&#9672; Order Planner</a>
+            <a class='quick-link' href='/planner'>&#9672; Order Planning</a>
             <a class='quick-link' href='/inventory'>&#9632; Inventory</a>
             <a class='quick-link' href='/operations'>&#9654; Operations</a>
             <a class='quick-link' href='/quality'>&#9888; Quality</a>

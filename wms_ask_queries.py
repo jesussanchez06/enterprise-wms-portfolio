@@ -20,6 +20,20 @@ def count_orders_by_status(conn) -> dict[str, int]:
     return {str(status or ""): int(count or 0) for status, count in c.fetchall()}
 
 
+def count_orders_created_on_date(conn, day_value, tzinfo=None) -> int:
+    start, end = _date_bounds(day_value, tzinfo=tzinfo)
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT COUNT(*)
+        FROM order_header
+        WHERE date >= ? AND date < ?
+        """,
+        (start, end),
+    )
+    return int(c.fetchone()[0] or 0)
+
+
 def count_shipped_on_date(conn, day_value, tzinfo=None) -> tuple[int, list[str]]:
     start, end = _date_bounds(day_value, tzinfo=tzinfo)
     c = conn.cursor()
@@ -656,3 +670,321 @@ def sla_breach_cause_hint(status: str) -> str:
         "Picking in Progress": "Pick still in progress",
     }
     return mapping.get(str(status or ""), "Cause not fully attributable from available fields")
+
+
+def _quality_note_text(discrepancy_type, inspector_notes, discrepancy_summary, damage) -> str:
+    notes = str(inspector_notes or "").strip()
+    summary = str(discrepancy_summary or "").strip()
+    dtype = str(discrepancy_type or "").strip()
+    if notes:
+        return notes
+    if summary:
+        # Prefer the human note portion when summary is a pipe-joined flag string.
+        if "Inspector notes:" in summary:
+            return summary.split("Inspector notes:", 1)[1].strip() or summary
+        return summary
+    if dtype:
+        return dtype
+    if str(damage or "").strip().lower() in {"yes", "y", "true", "1"}:
+        return "damage flagged during verification"
+    return ""
+
+
+def list_failed_audits(conn, limit: int = 12, day_value=None, tzinfo=None) -> list[dict[str, Any]]:
+    """Failed quality_audits, optionally filtered to a calendar day."""
+    c = conn.cursor()
+    limit = max(1, min(int(limit or 12), 25))
+    params: list[Any] = []
+    date_clause = ""
+    if day_value is not None:
+        start, end = _date_bounds(day_value, tzinfo=tzinfo)
+        date_clause = " AND qa.audit_time >= ? AND qa.audit_time < ?"
+        params.extend([start, end])
+    params.append(limit)
+    c.execute(
+        f"""
+        SELECT qa.audit_id, qa.audit_time, qa.order_number, qa.result, qa.auditor_role,
+               qa.part_match, qa.damage, qa.qty_match, qa.discrepancy_type,
+               qa.inspector_notes, qa.discrepancy_summary,
+               oh.status, oh.urgency,
+               sqi.issue_id, sqi.issue_type, sqi.issue_status, sqi.picker_name,
+               sqi.part_snapshot, sqi.root_cause_notes
+        FROM quality_audits qa
+        LEFT JOIN order_header oh ON oh.order_number = qa.order_number
+        LEFT JOIN supervisor_quality_issues sqi ON sqi.audit_id = qa.audit_id
+        WHERE qa.result = 'Failed'
+        {date_clause}
+        ORDER BY qa.audit_time DESC
+        LIMIT ?
+        """,
+        params,
+    )
+    rows = []
+    for row in c.fetchall():
+        note = _quality_note_text(row[8], row[9], row[10], row[6])
+        rows.append(
+            {
+                "audit_id": row[0],
+                "audit_time": row[1],
+                "order_number": row[2],
+                "result": row[3],
+                "auditor_role": row[4] or "Quality",
+                "part_match": row[5],
+                "damage": row[6],
+                "qty_match": row[7],
+                "discrepancy_type": row[8] or "",
+                "inspector_notes": row[9] or "",
+                "discrepancy_summary": row[10] or "",
+                "note": note,
+                "order_status": row[11],
+                "urgency": row[12],
+                "issue_id": row[13],
+                "issue_type": row[14],
+                "issue_status": row[15],
+                "picker_name": row[16],
+                "part_snapshot": row[17],
+                "root_cause_notes": row[18] or "",
+            }
+        )
+    return rows
+
+
+def list_quality_history(conn, limit: int = 12) -> list[dict[str, Any]]:
+    """Quality issues including resolved historical cases (excludes pure inventory shortages)."""
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT issue_id, order_number, issue_type, issue_status, picker_name,
+               part_snapshot, root_cause_notes, issue_date, audit_id
+        FROM supervisor_quality_issues
+        WHERE COALESCE(issue_type, '') != 'Inventory Shortage'
+        ORDER BY issue_date DESC
+        LIMIT ?
+        """,
+        (max(1, min(int(limit or 12), 25)),),
+    )
+    return [
+        {
+            "issue_id": row[0],
+            "order_number": row[1],
+            "issue_type": row[2],
+            "issue_status": row[3],
+            "picker_name": row[4],
+            "part_snapshot": row[5],
+            "root_cause_notes": row[6] or "",
+            "issue_date": row[7],
+            "audit_id": row[8],
+        }
+        for row in c.fetchall()
+    ]
+
+
+def list_audits_on_date(conn, day_value, tzinfo=None, limit: int = 15) -> list[dict[str, Any]]:
+    start, end = _date_bounds(day_value, tzinfo=tzinfo)
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT audit_id, audit_time, order_number, result, auditor_role,
+               discrepancy_type, inspector_notes, discrepancy_summary, damage
+        FROM quality_audits
+        WHERE audit_time >= ? AND audit_time < ?
+        ORDER BY audit_time DESC
+        LIMIT ?
+        """,
+        (start, end, max(1, min(int(limit or 15), 30))),
+    )
+    rows = []
+    for row in c.fetchall():
+        rows.append(
+            {
+                "audit_id": row[0],
+                "audit_time": row[1],
+                "order_number": row[2],
+                "result": row[3],
+                "auditor_role": row[4] or "Quality",
+                "discrepancy_type": row[5] or "",
+                "note": _quality_note_text(row[5], row[6], row[7], row[8]),
+            }
+        )
+    return rows
+
+
+def primary_failed_audit(conn, order_id: str | None = None) -> dict[str, Any] | None:
+    """Most relevant failed audit — specific order if given, else latest failed."""
+    if order_id:
+        rows = [
+            r
+            for r in list_failed_audits(conn, limit=25)
+            if str(r.get("order_number") or "").upper() == str(order_id).upper()
+            or str(order_id).upper() in str(r.get("order_number") or "").upper()
+        ]
+        return rows[0] if rows else None
+    rows = list_failed_audits(conn, limit=1)
+    return rows[0] if rows else None
+
+
+def order_lines_for(conn, order_number: str) -> list[dict[str, Any]]:
+    c = conn.cursor()
+    c.execute(
+        "SELECT sku, quantity FROM order_lines WHERE order_number = ? ORDER BY sku",
+        (order_number,),
+    )
+    return [{"sku": sku, "quantity": int(qty or 0)} for sku, qty in c.fetchall()]
+
+
+def get_order_picker(conn, order_number: str) -> dict[str, Any]:
+    """Best-effort picker: supervisor issue snapshot, else PICK transactions."""
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT picker_name FROM supervisor_quality_issues
+        WHERE order_number = ?
+          AND TRIM(COALESCE(picker_name, '')) <> ''
+        ORDER BY issue_date DESC
+        LIMIT 1
+        """,
+        (order_number,),
+    )
+    row = c.fetchone()
+    if row and row[0]:
+        return {"picker": str(row[0]), "source": "supervisor_quality_issues"}
+    c.execute(
+        """
+        SELECT user_role, tx_code, tx_time
+        FROM inventory_transactions
+        WHERE order_number = ?
+          AND tx_code IN ('PICK', 'PICK_CLOSE', 'PICK_START')
+          AND TRIM(COALESCE(user_role, '')) <> ''
+        ORDER BY
+            CASE tx_code WHEN 'PICK_CLOSE' THEN 0 WHEN 'PICK' THEN 1 ELSE 2 END,
+            tx_time DESC
+        LIMIT 1
+        """,
+        (order_number,),
+    )
+    row = c.fetchone()
+    if row and row[0]:
+        return {"picker": str(row[0]), "source": f"inventory_transactions.{row[1]}"}
+    c.execute(
+        "SELECT responsibility FROM order_header WHERE order_number = ? LIMIT 1",
+        (order_number,),
+    )
+    row = c.fetchone()
+    if row and row[0] and str(row[0]) not in {"Closed", "Unassigned", ""}:
+        return {"picker": str(row[0]), "source": "order_header.responsibility"}
+    return {"picker": None, "source": None}
+
+
+def order_ship_status(conn, order_number: str) -> dict[str, Any]:
+    detail = get_order_detail(conn, order_number)
+    if not detail:
+        return {"found": False}
+    completed = str(detail.get("status") or "") == "Completed"
+    ship_time = _order_completion_time(conn, detail["order_number"]) if completed else None
+    return {
+        "found": True,
+        "order_number": detail["order_number"],
+        "status": detail["status"],
+        "shipped": completed,
+        "ship_or_completion_time": ship_time,
+        "date": detail.get("date"),
+    }
+
+
+def average_completion_minutes(
+    conn,
+    *,
+    parse_order_datetime: Callable,
+) -> dict[str, Any]:
+    """Mean create→completion minutes for Completed orders with recoverable timestamps."""
+    c = conn.cursor()
+    c.execute(
+        "SELECT order_number, date FROM order_header WHERE status = 'Completed'"
+    )
+    samples = []
+    missing = 0
+    for order_number, date_str in c.fetchall():
+        completion_raw = _order_completion_time(conn, str(order_number))
+        if not completion_raw:
+            missing += 1
+            continue
+        try:
+            start = parse_order_datetime(date_str)
+            end = parse_order_datetime(completion_raw)
+            minutes = (end - start).total_seconds() / 60.0
+            if minutes < 0:
+                missing += 1
+                continue
+            samples.append(minutes)
+        except Exception:
+            missing += 1
+    if not samples:
+        return {"supported": False, "measured": 0, "missing": missing, "avg_minutes": None}
+    avg = sum(samples) / len(samples)
+    return {
+        "supported": True,
+        "measured": len(samples),
+        "missing": missing,
+        "avg_minutes": round(avg, 1),
+        "avg_hours": round(avg / 60.0, 2),
+    }
+
+
+def daily_completed_volume(conn, day_value, tzinfo=None) -> int:
+    count, _ = count_shipped_on_date(conn, day_value, tzinfo=tzinfo)
+    return count
+
+
+def active_pickers_now(conn) -> list[dict[str, Any]]:
+    """Pickers currently owning Picking in Progress orders (responsibility field)."""
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT responsibility, COUNT(*) 
+        FROM order_header
+        WHERE status = 'Picking in Progress'
+          AND TRIM(COALESCE(responsibility, '')) NOT IN ('', 'Closed', 'Unassigned')
+        GROUP BY responsibility
+        ORDER BY COUNT(*) DESC
+        """
+    )
+    return [{"picker": name, "orders": int(n or 0)} for name, n in c.fetchall()]
+
+
+def top_picker_by_orders(conn, limit: int = 5) -> list[dict[str, Any]]:
+    """Most completed-order pick activity from PICK transactions."""
+    return picker_workload(conn, limit=limit)
+
+
+def overstock_skus(conn, threshold: int = 500, limit: int = 8) -> list[dict[str, Any]]:
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT sku, SUM(quantity) AS tq
+        FROM inventory
+        GROUP BY sku
+        HAVING tq >= ?
+        ORDER BY tq DESC
+        LIMIT ?
+        """,
+        (threshold, max(1, min(int(limit or 8), 20))),
+    )
+    return [{"sku": sku, "qty": int(qty or 0)} for sku, qty in c.fetchall()]
+
+
+def quality_context_bundle(conn, order_number: str) -> dict[str, Any]:
+    """Bundle order_id / sku / picker for Ask WMS follow-up context."""
+    lines = order_lines_for(conn, order_number)
+    picker_info = get_order_picker(conn, order_number)
+    primary_sku = lines[0]["sku"] if lines else None
+    ship = order_ship_status(conn, order_number)
+    return {
+        "order_id": order_number,
+        "sku": primary_sku,
+        "skus": [line["sku"] for line in lines],
+        "lines": lines,
+        "picker": picker_info.get("picker"),
+        "picker_source": picker_info.get("source"),
+        "shipped": ship.get("shipped"),
+        "order_status": ship.get("status"),
+    }

@@ -27,9 +27,21 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
             "summarize today", "operations summary", "overall performance", "biggest issue",
             "operational risk", "end to end", "kpi overview", "scorecard", "pulse check",
             "ops snapshot", "management summary", "how is digitech", "warehouse performing",
-            "how are operations", "risk overview", "remaining risk",
+            "how are operations", "risk overview", "remaining risk", "warehouse health",
+            "completion rate", "top kpi", "executive overview",
         ],
         "weight": 5,
+    },
+    "kpi_snapshot": {
+        "concepts": ["executive"],
+        "phrases": [
+            "the kpi", "today kpi", "todays kpi", "important kpi", "current kpi",
+            "show kpi", "show me kpi", "give me kpi", "what are the kpi", "what are kpi",
+            "list kpi", "kpi today", "kpi status", "our kpi", "warehouse kpi",
+            "key performance", "performance indicator", "show me today kpi",
+            "give me the important kpi", "what kpi",
+        ],
+        "weight": 8,
     },
     "remaining_work": {
         "concepts": ["capacity", "orders"],
@@ -289,7 +301,8 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
         "phrases": [
             "ready to pick", "picks in progress", "workboard", "picking productivity",
             "who is picking", "backlog", "work queue", "picker workload", "picking backlog",
-            "pick queue", "ops queue", "picking summary",
+            "pick queue", "ops queue", "picking summary", "pipeline", "waiting verification",
+            "recently finished", "active pickers", "most orders picker", "blocked shortages",
         ],
         "weight": 6,
     },
@@ -298,16 +311,110 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
         "phrases": [
             "productivity", "units per hour", "picks per hour", "throughput rate",
             "picker productivity", "how productive", "efficiency rate", "output rate",
+            "avg daily volume", "average daily volume", "fill rate", "workload by responsibility",
+            "productivity trend", "daily volume",
         ],
         "weight": 7,
     },
     "quality_summary": {
         "concepts": ["quality"],
         "phrases": [
-            "quality pass", "pass rate", "quality issue", "quality problem", "quality problems",
-            "failed audit", "pending verification", "quality summary", "pick accuracy",
-            "quality audit pass rate", "audit pass rate",
-            "any quality", "open quality", "quality?", "qc status",
+            "quality pass", "pass rate", "quality summary", "pick accuracy",
+            "quality audit pass rate", "audit pass rate", "qc status",
+            "any quality", "open quality", "quality?", "quality problem", "quality problems",
+        ],
+        "weight": 6,
+    },
+    "quality_failed_detail": {
+        "concepts": ["quality"],
+        "phrases": [
+            "which audit failed", "audit failed", "failed inspection", "order failed inspection",
+            "why did the audit fail", "why did audit fail", "why fail", "what discrepancy",
+            "discrepancy was found", "carton damage", "carton crush", "corner crush",
+            "quality issue", "which order has a quality", "order with the mistake",
+            "the mistake", "with the mistake", "failed audit", "failed quality",
+            "which order failed", "inspection fail", "what went wrong with quality",
+            "quality verification fail", "damage found",
+        ],
+        "weight": 9,
+    },
+    "quality_audits_list": {
+        "concepts": ["quality"],
+        "phrases": [
+            "show failed audit", "failed audits", "list failed audit", "quality history",
+            "today's audit", "todays audit", "audits today", "show quality issue",
+            "list quality issue", "quality issues", "show audits", "audit history",
+            "recent audit", "all failed",
+        ],
+        "weight": 8,
+    },
+    "quality_auditor": {
+        "concepts": ["quality"],
+        "phrases": [
+            "who audited", "which auditor", "who was the auditor", "auditor?",
+            "who inspected", "which inspector", "who did the audit", "audited by",
+        ],
+        "weight": 9,
+    },
+    "context_picker": {
+        "concepts": ["picking"],
+        "phrases": [
+            "who picked it", "who picked that", "who picked the order", "which picker",
+            "who was the picker", "picker for it", "who picked", "picked by whom",
+        ],
+        "weight": 9,
+    },
+    "context_sku": {
+        "concepts": ["inventory", "orders"],
+        "phrases": [
+            "what sku was involved", "which sku was involved", "what sku", "which sku",
+            "sku involved", "what part was involved", "which part was on", "lines on it",
+            "what was the sku",
+        ],
+        "weight": 8,
+    },
+    "context_shipped": {
+        "concepts": ["shipping", "orders"],
+        "phrases": [
+            "was it shipped", "did it ship", "has it shipped", "was that shipped",
+            "did that order ship", "shipped yet", "is it completed", "did it complete",
+        ],
+        "weight": 9,
+    },
+    "kpi_attention": {
+        "concepts": ["executive", "priority"],
+        "phrases": [
+            "which kpi needs attention", "kpi needs attention", "which kpi", "kpi attention",
+            "what kpi is off", "kpi below", "needs attention", "which metric needs",
+        ],
+        "weight": 8,
+    },
+    "ai_briefing": {
+        "concepts": ["ai_analysis", "executive", "priority"],
+        "phrases": [
+            "focus today", "what should i focus", "summarize performance", "biggest risk",
+            "kpis below target", "top 3 actions", "top three actions", "vs yesterday",
+            "versus yesterday", "compared to yesterday", "30 minute review", "thirty minute",
+            "review first", "inventory attention", "warehouse attention", "why productivity",
+            "ai analysis", "first look",
+        ],
+        "weight": 8,
+    },
+    "avg_completion_time": {
+        "concepts": ["orders", "productivity", "executive"],
+        "phrases": [
+            "average completion time", "avg completion time", "avg completion",
+            "mean completion time", "how long to complete", "average cycle time",
+            "average order time", "completion time average",
+        ],
+        "weight": 9,
+    },
+    "orders_urgent_mix": {
+        "concepts": ["orders", "urgent", "critical", "blocked"],
+        "phrases": [
+            "urgent order", "count urgent", "how many urgent", "urgent critical blocked",
+            "urgency mix", "blocked waiting inventory", "missed sla", "longest order",
+            "fastest order", "completed today list", "list completed today",
         ],
         "weight": 6,
     },
@@ -316,15 +423,16 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
         "phrases": [
             "needs my attention", "control tower", "control tower status", "supervisor summary",
             "supervisor view", "supervisor", "escalation", "operational risk", "under pressure",
-            "floor issues", "supervisor status",
+            "floor issues", "supervisor status", "escalations", "dashboard summary",
+            "healthy urgency", "urgency mix supervisor",
         ],
         "weight": 7,
     },
     "planner_summary": {
         "concepts": ["planner"],
         "phrases": [
-            "planner", "destination", "urgency mix", "planned workload", "release",
-            "planner summary", "planning view", "workload by destination",
+            "planner", "order planning", "destination", "urgency mix", "planned workload", "release",
+            "planner summary", "order planning summary", "planning view", "workload by destination",
         ],
         "weight": 5,
     },
@@ -401,6 +509,11 @@ SHORT_FORM_MAP = {
     "stock": "inventory_summary",
     "quality": "quality_summary",
     "qc": "quality_summary",
+    "audits": "quality_audits_list",
+    "auditor": "quality_auditor",
+    "discrepancy": "quality_failed_detail",
+    "damage": "quality_failed_detail",
+    "mistake": "quality_failed_detail",
     "shipping": "shipping_summary",
     "shipments": "shipping_today",
     "blocked": "orders_by_status",
@@ -413,8 +526,8 @@ SHORT_FORM_MAP = {
     "bottleneck": "cross_ops_risk",
     "risks": "warehouse_summary",
     "risk": "warehouse_summary",
-    "kpis": "warehouse_summary",
-    "kpi": "warehouse_summary",
+    "kpis": "kpi_snapshot",
+    "kpi": "kpi_snapshot",
     "status": "warehouse_summary",
 }
 
@@ -422,9 +535,18 @@ SHORT_FORM_MAP = {
 def intent_family_for(intent: str | None) -> str | None:
     if intent in INVENTORY_RANKING_INTENTS:
         return "inventory_ranking"
-    if intent in {"picking_summary", "picker_count", "productivity_limits"}:
+    if intent in {"picking_summary", "picker_count", "productivity_limits", "context_picker"}:
         return "picking"
-    if intent in {"warehouse_count", "warehouse_summary", "warehouse_compare", "remaining_work"}:
+    if intent in {
+        "warehouse_count",
+        "warehouse_summary",
+        "warehouse_compare",
+        "remaining_work",
+        "kpi_snapshot",
+        "kpi_attention",
+        "ai_briefing",
+        "avg_completion_time",
+    }:
         return "warehouse_network"
     if intent in {"sla_summary", "sla_breached", "sla_at_risk", "sla_healthy", "otif_summary"}:
         return "sla"
@@ -438,9 +560,17 @@ def intent_family_for(intent: str | None) -> str | None:
         "orders_created_today",
         "orders_completed",
         "orders_oldest",
+        "orders_urgent_mix",
+        "context_shipped",
+        "context_sku",
     }:
         return "orders"
-    if intent in {"quality_summary"}:
+    if intent in {
+        "quality_summary",
+        "quality_failed_detail",
+        "quality_audits_list",
+        "quality_auditor",
+    }:
         return "quality"
     if intent in {"sku_inventory", "sku_open_orders"}:
         return "sku"
@@ -459,8 +589,12 @@ def _short_form_intent(normalized: str) -> str | None:
     words = token.split()
     if len(words) == 1:
         return SHORT_FORM_MAP.get(words[0])
-    if len(words) == 2 and words[0] in {"any", "whats", "what's", "show", "list"}:
+    if len(words) == 2 and words[0] in {"any", "whats", "what's", "show", "list", "todays", "today"}:
         return SHORT_FORM_MAP.get(words[1])
+    if len(words) <= 4 and "kpi" in words and not any(
+        w in words for w in ("define", "definition", "meaning", "explain", "calculated")
+    ):
+        return "kpi_snapshot"
     return None
 
 
@@ -541,6 +675,90 @@ def classify_intent(question: str, warehouses: list[str] | None = None, prior_co
             "concept_hits": hits,
             "intent_family": "orders",
         }
+
+    # Quality / order cross-module follow-ups (picker / SKU / shipped).
+    prior_order = prior.get("order_id") or prior_entities.get("order_id")
+    prior_family_is_quality = prior_family == "quality" or prior_intent in {
+        "quality_failed_detail",
+        "quality_audits_list",
+        "quality_auditor",
+        "quality_summary",
+        "order_status",
+    }
+    if prior_order and (
+        prior_family_is_quality
+        or prior.get("picker")
+        or prior_entities.get("sku")
+        or prior.get("sku")
+    ):
+        if re.search(r"\b(who picked|which picker|picked (it|that)|picker for)\b", normalized):
+            entities["order_id"] = prior_order
+            if prior.get("picker") or prior_entities.get("picker"):
+                entities["picker"] = prior.get("picker") or prior_entities.get("picker")
+            return {
+                "intent": "context_picker",
+                "confidence": "high",
+                "score": 98,
+                "entities": {**prior_entities, **entities, "follow_up": True},
+                "normalized": normalized,
+                "concept_hits": hits,
+                "intent_family": "picking",
+            }
+        if re.search(
+            r"\b(what sku|which sku|sku (was |is )?involved|what part|which part|lines? on it)\b",
+            normalized,
+        ):
+            entities["order_id"] = prior_order
+            if prior.get("sku") or prior_entities.get("sku"):
+                entities["sku"] = prior.get("sku") or prior_entities.get("sku")
+            return {
+                "intent": "context_sku",
+                "confidence": "high",
+                "score": 98,
+                "entities": {**prior_entities, **entities, "follow_up": True},
+                "normalized": normalized,
+                "concept_hits": hits,
+                "intent_family": "orders",
+            }
+        if re.search(
+            r"\b(was it shipped|did it ship|has it shipped|shipped yet|did it complete|is it completed)\b",
+            normalized,
+        ):
+            entities["order_id"] = prior_order
+            return {
+                "intent": "context_shipped",
+                "confidence": "high",
+                "score": 98,
+                "entities": {**prior_entities, **entities, "follow_up": True},
+                "normalized": normalized,
+                "concept_hits": hits,
+                "intent_family": "orders",
+            }
+        if re.search(r"\b(who audited|which auditor|auditor|who inspected)\b", normalized):
+            entities["order_id"] = prior_order
+            return {
+                "intent": "quality_auditor",
+                "confidence": "high",
+                "score": 97,
+                "entities": {**prior_entities, **entities, "follow_up": True},
+                "normalized": normalized,
+                "concept_hits": hits,
+                "intent_family": "quality",
+            }
+        if re.search(
+            r"\b(why (did )?(it |the audit )?fail|what discrepancy|carton|damage|mistake)\b",
+            normalized,
+        ):
+            entities["order_id"] = prior_order
+            return {
+                "intent": "quality_failed_detail",
+                "confidence": "high",
+                "score": 97,
+                "entities": {**prior_entities, **entities, "follow_up": True},
+                "normalized": normalized,
+                "concept_hits": hits,
+                "intent_family": "quality",
+            }
 
     # Inventory ranking continuity: short reframes after a SKU/qty ranking turn.
     if prior_family == "inventory_ranking" or prior_intent in INVENTORY_RANKING_INTENTS:
@@ -698,6 +916,17 @@ def classify_intent(question: str, warehouses: list[str] | None = None, prior_co
     if re.search(r"\bdefine\b", normalized) and re.search(r"\b(sla|otif|kpi|accuracy)\b", normalized):
         scores["kpi_definitions"] += 16
         scores["otif_summary"] -= 8
+    # Live KPI values (not definitions): "what are the KPIs?", "today's KPIs", etc.
+    if re.search(r"\bkpi\b", normalized) and not re.search(
+        r"\b(what is|define|definition|meaning of|how is .* calculated|explain)\b",
+        normalized,
+    ):
+        scores["kpi_snapshot"] += 16
+        scores["warehouse_summary"] += 4
+        scores["kpi_definitions"] -= 10
+    if re.search(r"\bkpi\b", normalized) and re.search(r"\b(definition|define|meaning)\b", normalized):
+        scores["kpi_definitions"] += 18
+        scores["kpi_snapshot"] -= 20
     if re.search(
         r"\b(inventory.*(sla|late|delay)|quality.*(ship|shipping)|bottleneck|blocking fulfillment)\b",
         normalized,
@@ -724,6 +953,66 @@ def classify_intent(question: str, warehouses: list[str] | None = None, prior_co
         scores["sku_inventory"] += 10
     if entities.get("order_id") and not hits.get("write_request"):
         scores["order_status"] += 12
+
+    # Quality family routing — failed detail / lists / auditor beat generic summary.
+    qualityish = bool(hits.get("quality")) or bool(
+        re.search(
+            r"\b(audit|quality|qc|inspection|discrepanc|damage|carton|mistake|auditor)\b",
+            normalized,
+        )
+    )
+    if qualityish:
+        if re.search(
+            r"\b(who audited|which auditor|auditor\b|who inspected|which inspector)\b",
+            normalized,
+        ):
+            scores["quality_auditor"] += 22
+            scores["quality_summary"] -= 8
+        elif re.search(
+            r"\b(show failed|failed audit|list failed|quality history|audits today|today.?s audit|"
+            r"list quality|show quality issue|audit history|recent audit)\b",
+            normalized,
+        ) or (re.search(r"\bquality issue\b", normalized) and re.search(r"\b(show|list|all)\b", normalized)):
+            scores["quality_audits_list"] += 20
+            scores["quality_summary"] -= 6
+        elif re.search(
+            r"\b(failed|fail|mistake|discrepanc|carton|crush|damage|which audit|which order.*"
+            r"(quality|inspection|mistake)|why.*(fail|audit)|inspection)\b",
+            normalized,
+        ) or re.search(r"\b(quality issue|order.*mistake|mistake.*order)\b", normalized):
+            scores["quality_failed_detail"] += 20
+            scores["quality_summary"] -= 8
+            scores["orders_by_status"] -= 6
+        elif re.search(r"\b(pass rate|quality summary|qc status|any quality|quality\?)\b", normalized):
+            scores["quality_summary"] += 10
+
+    # Standalone follow-up-style questions without prior still map to intents (engine asks for context).
+    if re.search(r"\b(who picked( it| that)?|which picker)\b", normalized):
+        scores["context_picker"] += 16
+        scores["picker_count"] -= 6
+    if re.search(r"\b(what sku was involved|which sku was involved|sku involved)\b", normalized):
+        scores["context_sku"] += 18
+        scores["top_inventory_qty"] -= 10
+        scores["sku_inventory"] -= 6
+    if re.search(r"\b(was it shipped|did it ship|has it shipped|shipped yet)\b", normalized):
+        scores["context_shipped"] += 18
+        scores["shipping_today"] -= 10
+
+    if re.search(r"\b(which kpi|kpi needs attention|needs attention)\b", normalized):
+        scores["kpi_attention"] += 16
+        scores["recommended_actions"] += 4
+    if hits.get("ai_analysis") or re.search(
+        r"\b(focus today|summarize performance|biggest risk|vs yesterday|30 minute|thirty minute|"
+        r"top 3 actions|top three actions|below target|first look)\b",
+        normalized,
+    ):
+        scores["ai_briefing"] += 16
+        if re.search(r"\btop\s+(3|three)\s+actions?\b", normalized):
+            scores["recommended_actions"] += 8
+    if re.search(r"\b(average|avg|mean)\b", normalized) and re.search(
+        r"\b(completion|cycle)\s+time\b", normalized
+    ):
+        scores["avg_completion_time"] += 20
 
     inventoryish = bool(hits.get("inventory")) or bool(
         re.search(r"\b(sku|part|stock|inventory|units?)\b", normalized)
