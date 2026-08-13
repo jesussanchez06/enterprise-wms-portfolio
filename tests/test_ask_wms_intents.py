@@ -763,6 +763,11 @@ def test_intent_catalog_size():
     assert len(INTENT_DEFS) >= 48
 
 
+def test_concept_and_spelling_coverage():
+    assert len(CONCEPTS) >= 20
+    assert len(SPELLING_FIXES) >= 40
+
+
 def test_phrase_variation_count_floor():
     """Guardrail: keep substantial phrase-variation coverage across families."""
     buckets = [

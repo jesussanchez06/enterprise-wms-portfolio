@@ -333,7 +333,7 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
             "which audit failed", "audit failed", "failed inspection", "order failed inspection",
             "why did the audit fail", "why did audit fail", "why fail", "what discrepancy",
             "discrepancy was found", "carton damage", "carton crush", "corner crush",
-            "quality issue", "which order has a quality", "order with the mistake",
+            "which order has a quality", "order with the mistake",
             "the mistake", "with the mistake", "failed audit", "failed quality",
             "which order failed", "inspection fail", "what went wrong with quality",
             "quality verification fail", "damage found",
@@ -345,7 +345,7 @@ INTENT_DEFS: dict[str, dict[str, Any]] = {
         "phrases": [
             "show failed audit", "failed audits", "list failed audit", "quality history",
             "today's audit", "todays audit", "audits today", "show quality issue",
-            "list quality issue", "quality issues", "show audits", "audit history",
+            "list quality issue", "show audits", "audit history",
             "recent audit", "all failed",
         ],
         "weight": 8,
@@ -1009,8 +1009,9 @@ def classify_intent(question: str, warehouses: list[str] | None = None, prior_co
         scores["shipping_today"] -= 10
 
     if re.search(r"\b(which kpi|kpi needs attention|kpi attention|metric needs)\b", normalized):
-        scores["kpi_attention"] += 16
-        scores["recommended_actions"] -= 4
+        scores["kpi_attention"] += 24
+        scores["kpi_snapshot"] -= 18
+        scores["recommended_actions"] -= 6
     if hits.get("ai_analysis") or re.search(
         r"\b(focus today|summarize performance|biggest risk|vs yesterday|30 minute|thirty minute|"
         r"below target|first look|ai analysis|review first)\b",
@@ -1023,6 +1024,11 @@ def classify_intent(question: str, warehouses: list[str] | None = None, prior_co
         r"\b(completion|cycle)\s+time\b", normalized
     ):
         scores["avg_completion_time"] += 20
+
+    # Live KPI values should not steal "which KPI needs attention"
+    if re.search(r"\bkpi\b", normalized) and re.search(r"\battention\b", normalized):
+        scores["kpi_attention"] += 10
+        scores["kpi_snapshot"] -= 12
 
     inventoryish = bool(hits.get("inventory")) or bool(
         re.search(r"\b(sku|part|stock|inventory|units?)\b", normalized)
