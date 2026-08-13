@@ -1,4 +1,4 @@
-from flask import Flask, request, redirect, render_template_string, send_from_directory, Response, session, has_request_context
+from flask import Flask, request, redirect, render_template_string, send_from_directory, Response, session, has_request_context, g
 import sqlite3
 from datetime import datetime
 import pandas as pd
@@ -17,6 +17,7 @@ import time
 import signal
 import re
 import secrets
+import threading
 from urllib.parse import urlencode
 from html import escape as html_escape
 from werkzeug.utils import secure_filename
@@ -35,8 +36,11 @@ SESSION_DB_DIR = os.path.join(BASE_DIR, "demo_sessions")
 # Backward-compatible alias used by older call sites / docs.
 DB = MASTER_DB
 SESSION_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+DEMO_SESSION_COOKIE = "wms_demo_sid"
 DEMO_SESSION_TTL_SECONDS = int(os.environ.get("WMS_DEMO_SESSION_TTL_HOURS", "24")) * 3600
 _DEMO_CLEANUP_COUNTER = 0
+_CLONE_LOCKS_GUARD = threading.Lock()
+_CLONE_LOCKS = {}
 
 
 class DemoWorkspaceError(RuntimeError):
@@ -173,12 +177,34 @@ def validate_demo_session_id(session_id):
     return True
 
 
+def _session_thread_lock(session_id):
+    """Per-session lock so concurrent threads cannot corrupt the same clone."""
+    with _CLONE_LOCKS_GUARD:
+        lock = _CLONE_LOCKS.get(session_id)
+        if lock is None:
+            lock = threading.Lock()
+            _CLONE_LOCKS[session_id] = lock
+        return lock
+
+
 def get_demo_session_id():
+    """Return this visitor's opaque session ID, creating and persisting it if needed.
+
+    Source of truth is a dedicated HttpOnly cookie (`wms_demo_sid`). Flask's signed
+    session also stores the same ID so existing tests and Ask WMS follow-up context
+    keep working.
+    """
+    if not has_request_context():
+        raise DemoWorkspaceError("Visitor database requires an HTTP request context.")
+
     session_id = session.get("demo_session_id")
     if not validate_demo_session_id(session_id):
+        session_id = request.cookies.get(DEMO_SESSION_COOKIE)
+    if not validate_demo_session_id(session_id):
         session_id = uuid4().hex
-        session["demo_session_id"] = session_id
+    session["demo_session_id"] = session_id
     session.permanent = True
+    g.demo_session_id = session_id
     return session_id
 
 
@@ -203,8 +229,48 @@ def touch_session_db(path):
         pass
 
 
+def visitor_db_is_expired(path, ttl_seconds=None):
+    """True when this clone's mtime is older than the demo TTL (idle timeout)."""
+    if not path or not os.path.exists(path):
+        return False
+    ttl = DEMO_SESSION_TTL_SECONDS if ttl_seconds is None else int(ttl_seconds)
+    try:
+        age = time.time() - os.path.getmtime(path)
+    except OSError:
+        return True
+    return age >= ttl
+
+
+def _copy_master_to(dest_path):
+    """Snapshot the read-only master into dest_path. Never writes the master file."""
+    try:
+        try:
+            source = sqlite3.connect(
+                f"file:{MASTER_DB}?mode=ro", uri=True, timeout=10, check_same_thread=False
+            )
+        except sqlite3.Error:
+            source = sqlite3.connect(MASTER_DB, timeout=10, check_same_thread=False)
+        try:
+            destination = sqlite3.connect(dest_path, timeout=10, check_same_thread=False)
+            try:
+                source.backup(destination)
+                destination.commit()
+            finally:
+                destination.close()
+        finally:
+            source.close()
+    except sqlite3.Error:
+        # Equivalent fallback: byte-copy the seed file (master still not opened for write).
+        shutil.copy2(MASTER_DB, dest_path)
+
+
 def clone_master_database(dest_path):
-    """Copy the read-only master seed into a private visitor SQLite file."""
+    """Copy the read-only master seed into a private visitor SQLite file.
+
+    Copy into a temp file, then os.replace onto the destination so concurrent
+    requests never observe a half-written clone. sqlite3.backup is preferred
+    (consistent SQLite snapshot); shutil.copy2 is the fallback.
+    """
     ensure_session_db_dir()
     parent = os.path.dirname(dest_path)
     if parent:
@@ -212,20 +278,24 @@ def clone_master_database(dest_path):
     if not os.path.exists(MASTER_DB):
         raise DemoWorkspaceError("Demo seed database is missing.")
 
-    # Prefer read-only open of the seed so visitor cloning cannot mutate it.
+    tmp_path = f"{dest_path}.{uuid4().hex}.tmp"
     try:
-        source = sqlite3.connect(f"file:{MASTER_DB}?mode=ro", uri=True, timeout=10, check_same_thread=False)
-    except sqlite3.Error:
-        source = sqlite3.connect(MASTER_DB, timeout=10, check_same_thread=False)
-    try:
-        destination = sqlite3.connect(dest_path, timeout=10, check_same_thread=False)
+        _copy_master_to(tmp_path)
+        for sidecar in (f"{dest_path}-wal", f"{dest_path}-shm"):
+            if os.path.exists(sidecar):
+                try:
+                    os.remove(sidecar)
+                except OSError:
+                    pass
         try:
-            source.backup(destination)
-            destination.commit()
-        finally:
-            destination.close()
-    finally:
-        source.close()
+            os.replace(tmp_path, dest_path)
+        except OSError:
+            # Windows can refuse replace while another handle is open.
+            shutil.copy2(tmp_path, dest_path)
+            _remove_sqlite_file(tmp_path)
+    except Exception:
+        _remove_sqlite_file(tmp_path)
+        raise
 
     if not os.path.exists(dest_path) or sqlite_order_count(dest_path) <= 0:
         _remove_sqlite_file(dest_path)
@@ -233,7 +303,7 @@ def clone_master_database(dest_path):
 
 
 def visitor_db_needs_reclone(path):
-    """Reclone only missing/empty/corrupt files — never wipe an active recruiter workspace."""
+    """Reclone missing/empty/corrupt files — never wipe an active recruiter workspace."""
     if not path or not os.path.exists(path):
         return True
     try:
@@ -247,43 +317,49 @@ def visitor_db_needs_reclone(path):
 
 
 def ensure_visitor_session_db(force_reset=False):
-    """Ensure this browser has a private SQLite clone. Never falls back to the shared seed for writes."""
+    """Ensure this browser has a private SQLite clone. Never falls back to the shared seed for writes.
+
+    TTL recreate: if this visitor's clone is older than WMS_DEMO_SESSION_TTL_HOURS
+    (mtime / last activity), replace it from master and keep the same session ID
+    so the cookie stays valid. Simpler and correct vs issuing a new ID.
+    """
     if not has_request_context():
         raise DemoWorkspaceError("Visitor database requires an HTTP request context.")
 
-    path = session_db_path()
-    if force_reset and os.path.exists(path):
-        _remove_sqlite_file(path)
+    session_id = get_demo_session_id()
+    path = session_db_path(session_id)
 
-    if visitor_db_needs_reclone(path) or force_reset:
-        if os.path.exists(path):
-            _remove_sqlite_file(path)
-        if not db_has_demo_baseline(MASTER_DB):
-            # Rebuild seed only — visitors never write the seed during normal ops.
-            ensure_bootstrap_demo_data(force_orders=True)
-        if not os.path.exists(MASTER_DB):
-            raise DemoWorkspaceError("Demo seed database is missing.")
-        try:
-            clone_master_database(path)
-        except DemoWorkspaceError:
-            raise
-        except Exception as exc:
-            _remove_sqlite_file(path)
+    with _session_thread_lock(session_id):
+        expired = visitor_db_is_expired(path)
+        if visitor_db_needs_reclone(path) or force_reset or expired:
+            if not db_has_demo_baseline(MASTER_DB):
+                # Rebuild seed only — visitors never write the seed during normal ops.
+                ensure_bootstrap_demo_data(force_orders=True)
+            if not os.path.exists(MASTER_DB):
+                raise DemoWorkspaceError("Demo seed database is missing.")
+            try:
+                clone_master_database(path)
+            except DemoWorkspaceError:
+                raise
+            except Exception as exc:
+                _remove_sqlite_file(path)
+                raise DemoWorkspaceError(
+                    "Your private demo workspace could not be initialized. Please refresh and try again."
+                ) from exc
+
+        if not os.path.exists(path):
             raise DemoWorkspaceError(
                 "Your private demo workspace could not be initialized. Please refresh and try again."
-            ) from exc
+            )
 
-    if not os.path.exists(path):
-        raise DemoWorkspaceError(
-            "Your private demo workspace could not be initialized. Please refresh and try again."
-        )
+        # Absolute safety: never allow resolving the master path as a visitor DB.
+        if os.path.abspath(path) == os.path.abspath(MASTER_DB):
+            raise DemoWorkspaceError("Refusing to bind visitor traffic to the shared seed database.")
 
-    # Absolute safety: never allow resolving the master path as a visitor DB.
-    if os.path.abspath(path) == os.path.abspath(MASTER_DB):
-        raise DemoWorkspaceError("Refusing to bind visitor traffic to the shared seed database.")
-
-    touch_session_db(path)
-    return path
+        touch_session_db(path)
+        g.demo_db_path = path
+        g.demo_session_id = session_id
+        return path
 
 
 def get_current_demo_db():
@@ -295,6 +371,9 @@ def resolve_db_path(use_master=False):
     if use_master:
         return MASTER_DB
     if has_request_context():
+        cached = getattr(g, "demo_db_path", None)
+        if cached:
+            return cached
         return ensure_visitor_session_db()
     # Outside requests (CLI/bootstrap only) — never used by HTTP handlers.
     return MASTER_DB
@@ -3169,10 +3248,25 @@ if not _secret:
     # Ephemeral fallback for local/dev only — sessions reset when the process restarts.
     _secret = secrets.token_hex(32)
 app.secret_key = _secret
-app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=14)
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(seconds=max(DEMO_SESSION_TTL_SECONDS, 3600))
+app.config["SESSION_REFRESH_EACH_REQUEST"] = True
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+# Render terminates TLS; local http must keep Secure off so the cookie still sets.
+app.config["SESSION_COOKIE_SECURE"] = (
+    bool(os.environ.get("RENDER", "").strip())
+    or os.environ.get("WMS_SESSION_COOKIE_SECURE", "").strip().lower() in {"1", "true", "yes", "on"}
+)
 EXCEL_FILE = os.path.join(BASE_DIR, "WHS Management.xlsx")
+
+
+def _demo_cookie_secure():
+    if app.config.get("SESSION_COOKIE_SECURE"):
+        return True
+    if request.is_secure:
+        return True
+    proto = (request.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+    return proto == "https"
 
 
 @app.before_request
@@ -3184,7 +3278,7 @@ def bind_isolated_demo_session():
     if not _APP_BOOTSTRAPPED:
         bootstrap_application()
     try:
-        ensure_visitor_session_db()
+        g.demo_db_path = ensure_visitor_session_db()
         cleanup_stale_demo_sessions()
     except DemoWorkspaceError as exc:
         return (
@@ -3197,6 +3291,26 @@ def bind_isolated_demo_session():
             503,
         )
     return None
+
+
+@app.after_request
+def set_demo_session_cookie(response):
+    """Persist the visitor session ID in a dedicated secure cookie aligned with TTL."""
+    if request.endpoint == "static":
+        return response
+    session_id = getattr(g, "demo_session_id", None) or session.get("demo_session_id")
+    if not validate_demo_session_id(session_id):
+        return response
+    response.set_cookie(
+        DEMO_SESSION_COOKIE,
+        session_id,
+        max_age=DEMO_SESSION_TTL_SECONDS,
+        httponly=True,
+        samesite="Lax",
+        secure=_demo_cookie_secure(),
+        path="/",
+    )
+    return response
 
 
 @app.errorhandler(DemoWorkspaceError)

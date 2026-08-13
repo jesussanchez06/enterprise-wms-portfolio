@@ -12,5 +12,8 @@ services:
         generateValue: true
       - key: FLASK_DEBUG
         value: "0"
+      - key: WMS_DEMO_SESSION_TTL_HOURS
+        value: "24"
     # Free tier uses ephemeral disk. On each cold start the app rebuilds
     # enterprise_wms_master.db with the 82-order completed baseline if missing.
+    # Visitor clones live under demo_sessions/ and are not persisted across deploys.

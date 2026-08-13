@@ -216,8 +216,65 @@ def test_visitor_never_resolves_to_master(monkeypatch=None):
             conn.close()
 
 
+def test_ttl_recreate_keeps_session_id_and_restores_master():
+    import time
+
+    wms.bootstrap_application(force_orders=False)
+    seed_hash = _file_sha256(wms.MASTER_DB)
+    seed_orders = wms.sqlite_order_count(wms.MASTER_DB)
+    sid = "d" * 32
+    client = wms.app.test_client()
+    with client.session_transaction() as sess:
+        sess["demo_session_id"] = sid
+    assert client.get("/executive").status_code == 200
+    path = os.path.join(wms.SESSION_DB_DIR, f"{sid}.db")
+
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO order_header (
+                order_number, request_id, date, source, destination, urgency, status,
+                responsibility, expected_quantity, picked_quantity
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ORD-TTL-VISITOR-1",
+                "REQ-TTL-V1",
+                wms.now_pt().isoformat(),
+                wms.SOURCE_WAREHOUSE,
+                "Los Angeles Warehouse 200",
+                "Standard",
+                "Orders Placed",
+                "Planner",
+                1,
+                0,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    os.utime(path, (time.time() - wms.DEMO_SESSION_TTL_SECONDS - 60,) * 2)
+    assert client.get("/ask-wms").status_code == 200
+    conn = sqlite3.connect(path)
+    try:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM order_header WHERE order_number = ?",
+                ("ORD-TTL-VISITOR-1",),
+            ).fetchone()[0]
+            == 0
+        )
+        assert _order_count(conn) == seed_orders
+    finally:
+        conn.close()
+    assert _file_sha256(wms.MASTER_DB) == seed_hash
+
+
 if __name__ == "__main__":
     test_session_id_validation()
     test_two_visitors_isolated_orders_and_inventory()
     test_visitor_never_resolves_to_master()
+    test_ttl_recreate_keeps_session_id_and_restores_master()
     print("ALL VISITOR ISOLATION TESTS PASSED")
