@@ -134,6 +134,13 @@ def test_cross_module_follow_ups(conn):
     assert "completed" in html.lower() or "ship" in html.lower()
     assert "ord-dt82-0081" in html.lower()
 
+    # Context must survive an intervening KPI question.
+    _html, _, mid = _answer(conn, "What are the KPIs?", prior=context)
+    assert mid.get("order_id") == "ORD-DT82-0081"
+    html, _, ctx = _answer(conn, "Was it shipped?", prior=mid)
+    assert "ord-dt82-0081" in html.lower()
+    assert "completed" in html.lower() or "yes" in html.lower()
+
 
 def test_kpi_snapshot_and_attention(conn):
     html, _, _ = _answer(conn, "What are the KPIs?")

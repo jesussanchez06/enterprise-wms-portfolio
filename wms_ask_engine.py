@@ -129,14 +129,19 @@ def answer_question(
             "concept_hits": classification.get("concept_hits"),
         }
 
+    prior = prior_context or {}
     context = {
         "intent": intent,
         "intent_family": classification.get("intent_family") or intents.intent_family_for(intent),
         "entities": entities,
-        "sku": entities.get("sku"),
-        "order_id": entities.get("order_id"),
-        "urgency": entities.get("urgency"),
-        "picker": entities.get("picker") or (prior_context or {}).get("picker"),
+        "sku": entities.get("sku") or prior.get("sku") or (prior.get("entities") or {}).get("sku"),
+        "order_id": entities.get("order_id")
+        or prior.get("order_id")
+        or (prior.get("entities") or {}).get("order_id"),
+        "urgency": entities.get("urgency") or prior.get("urgency"),
+        "picker": entities.get("picker")
+        or prior.get("picker")
+        or (prior.get("entities") or {}).get("picker"),
     }
 
     def _attach_quality_context(order_number: str | None) -> None:
