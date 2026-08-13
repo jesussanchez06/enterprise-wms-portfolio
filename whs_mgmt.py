@@ -11374,6 +11374,9 @@ def supervisor():
 # ======================================================
 # EXECUTIVE DASHBOARD
 # ======================================================
+@app.route("/healthz")
+def healthz():
+    return {"status": "ok"}, 200
 @app.route("/executive")
 def executive_dashboard():
     conn = get_conn()
