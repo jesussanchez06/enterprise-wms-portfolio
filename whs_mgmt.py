@@ -1,10 +1,11 @@
-from flask import Flask, request, redirect, render_template_string, send_from_directory, Response
+from flask import Flask, request, redirect, render_template_string, send_from_directory, Response, session, has_request_context, g
 import sqlite3
 from datetime import datetime
 import pandas as pd
 import os
 import io
 import base64
+import shutil
 from datetime import timedelta
 from uuid import uuid4
 import random
@@ -15,7 +16,10 @@ import subprocess
 import time
 import signal
 import re
+import secrets
+import threading
 from urllib.parse import urlencode
+from html import escape as html_escape
 from werkzeug.utils import secure_filename
 from zoneinfo import ZoneInfo
 
@@ -26,12 +30,378 @@ import matplotlib.pyplot as plt
 # Python 3.12 deprecation warning about the default adapter)
 sqlite3.register_adapter(datetime, lambda dt: dt.isoformat())
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MASTER_DB = os.path.join(BASE_DIR, "enterprise_wms_master.db")
+LEGACY_DB = os.path.join(BASE_DIR, "enterprise_wms.db")
+SESSION_DB_DIR = os.path.join(BASE_DIR, "demo_sessions")
+# Backward-compatible alias used by older call sites / docs.
+DB = MASTER_DB
+SESSION_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+DEMO_SESSION_COOKIE = "wms_demo_sid"
+DEMO_SESSION_TTL_SECONDS = int(os.environ.get("WMS_DEMO_SESSION_TTL_HOURS", "24")) * 3600
+_DEMO_CLEANUP_COUNTER = 0
+_CLONE_LOCKS_GUARD = threading.Lock()
+_CLONE_LOCKS = {}
+
+
+class DemoWorkspaceError(RuntimeError):
+    """Raised when a private visitor workspace cannot be created or resolved."""
+
+
+def ensure_session_db_dir():
+    os.makedirs(SESSION_DB_DIR, exist_ok=True)
+
+
+def migrate_legacy_db_to_master():
+    """Promote the original shared DB into the master seed if needed."""
+    if os.path.exists(MASTER_DB):
+        return False
+    if os.path.exists(LEGACY_DB):
+        shutil.copy2(LEGACY_DB, MASTER_DB)
+        return True
+    return False
+
+
+def _remove_sqlite_file(path):
+    """Delete a SQLite DB and its WAL/SHM sidecars if present."""
+    removed = 0
+    for candidate in (path, f"{path}-wal", f"{path}-shm"):
+        if os.path.exists(candidate):
+            try:
+                os.remove(candidate)
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+def purge_demo_session_databases():
+    """Delete every visitor clone so the next request reclones from master."""
+    ensure_session_db_dir()
+    removed = 0
+    for name in os.listdir(SESSION_DB_DIR):
+        if not (name.endswith(".db") or name.endswith(".db-wal") or name.endswith(".db-shm")):
+            continue
+        path = os.path.join(SESSION_DB_DIR, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            os.remove(path)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def cleanup_stale_demo_sessions(ttl_seconds=None, force=False):
+    """Remove inactive visitor DBs older than TTL. Never deletes the master seed."""
+    global _DEMO_CLEANUP_COUNTER
+    ttl = DEMO_SESSION_TTL_SECONDS if ttl_seconds is None else int(ttl_seconds)
+    _DEMO_CLEANUP_COUNTER += 1
+    # Probabilistic / periodic: every ~40th request, or when forced.
+    if not force and (_DEMO_CLEANUP_COUNTER % 40) != 0:
+        return 0
+    ensure_session_db_dir()
+    now = time.time()
+    removed = 0
+    active_id = None
+    try:
+        if has_request_context():
+            active_id = session.get("demo_session_id")
+    except Exception:
+        active_id = None
+    for name in os.listdir(SESSION_DB_DIR):
+        if not name.endswith(".db"):
+            continue
+        session_key = name[:-3]
+        if active_id and session_key == active_id:
+            continue
+        path = os.path.join(SESSION_DB_DIR, name)
+        try:
+            age = now - os.path.getmtime(path)
+        except OSError:
+            continue
+        if age >= ttl:
+            removed += _remove_sqlite_file(path)
+    return removed
+
+
+def sqlite_order_count(db_path):
+    if not db_path or not os.path.exists(db_path):
+        return 0
+    try:
+        conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+        try:
+            row = conn.execute("SELECT COUNT(*) FROM order_header").fetchone()
+            return int(row[0] or 0) if row else 0
+        except Exception:
+            return 0
+        finally:
+            conn.close()
+    except Exception:
+        return 0
+
+
+def db_has_demo_baseline(db_path):
+    """True when the DB has the exact tagged 82-order recruiter baseline."""
+    if not db_path or not os.path.exists(db_path):
+        return False
+    try:
+        from wms_demo_seed import demo_baseline_present
+
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10, check_same_thread=False)
+        try:
+            return bool(demo_baseline_present(conn))
+        finally:
+            conn.close()
+    except Exception:
+        try:
+            conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+            try:
+                from wms_demo_seed import demo_baseline_present
+
+                return bool(demo_baseline_present(conn))
+            finally:
+                conn.close()
+        except Exception:
+            return False
+
+
+def validate_demo_session_id(session_id):
+    """Only allow opaque hex IDs so cookies cannot path-traverse to other DBs."""
+    if not session_id or not isinstance(session_id, str):
+        return False
+    if not SESSION_ID_RE.fullmatch(session_id):
+        return False
+    if ".." in session_id or "/" in session_id or "\\" in session_id:
+        return False
+    return True
+
+
+def _session_thread_lock(session_id):
+    """Per-session lock so concurrent threads cannot corrupt the same clone."""
+    with _CLONE_LOCKS_GUARD:
+        lock = _CLONE_LOCKS.get(session_id)
+        if lock is None:
+            lock = threading.Lock()
+            _CLONE_LOCKS[session_id] = lock
+        return lock
+
+
+def get_demo_session_id():
+    """Return this visitor's opaque session ID, creating and persisting it if needed.
+
+    Source of truth is a dedicated HttpOnly cookie (`wms_demo_sid`). Flask's signed
+    session also stores the same ID so existing tests and Ask WMS follow-up context
+    keep working.
+    """
+    if not has_request_context():
+        raise DemoWorkspaceError("Visitor database requires an HTTP request context.")
+
+    session_id = session.get("demo_session_id")
+    if not validate_demo_session_id(session_id):
+        session_id = request.cookies.get(DEMO_SESSION_COOKIE)
+    if not validate_demo_session_id(session_id):
+        session_id = uuid4().hex
+    session["demo_session_id"] = session_id
+    session.permanent = True
+    g.demo_session_id = session_id
+    return session_id
+
+
+def session_db_path(session_id=None):
+    ensure_session_db_dir()
+    resolved_id = session_id or get_demo_session_id()
+    if not validate_demo_session_id(resolved_id):
+        raise DemoWorkspaceError("Invalid demo session identifier.")
+    # Resolve under SESSION_DB_DIR only (prevents path escape).
+    path = os.path.abspath(os.path.join(SESSION_DB_DIR, f"{resolved_id}.db"))
+    root = os.path.abspath(SESSION_DB_DIR)
+    if os.path.commonpath([root, path]) != root:
+        raise DemoWorkspaceError("Invalid demo session path.")
+    return path
+
+
+def touch_session_db(path):
+    try:
+        if path and os.path.exists(path):
+            os.utime(path, None)
+    except OSError:
+        pass
+
+
+def visitor_db_is_expired(path, ttl_seconds=None):
+    """True when this clone's mtime is older than the demo TTL (idle timeout)."""
+    if not path or not os.path.exists(path):
+        return False
+    ttl = DEMO_SESSION_TTL_SECONDS if ttl_seconds is None else int(ttl_seconds)
+    try:
+        age = time.time() - os.path.getmtime(path)
+    except OSError:
+        return True
+    return age >= ttl
+
+
+def _copy_master_to(dest_path):
+    """Snapshot the read-only master into dest_path. Never writes the master file."""
+    try:
+        try:
+            source = sqlite3.connect(
+                f"file:{MASTER_DB}?mode=ro", uri=True, timeout=10, check_same_thread=False
+            )
+        except sqlite3.Error:
+            source = sqlite3.connect(MASTER_DB, timeout=10, check_same_thread=False)
+        try:
+            destination = sqlite3.connect(dest_path, timeout=10, check_same_thread=False)
+            try:
+                source.backup(destination)
+                destination.commit()
+            finally:
+                destination.close()
+        finally:
+            source.close()
+    except sqlite3.Error:
+        # Equivalent fallback: byte-copy the seed file (master still not opened for write).
+        shutil.copy2(MASTER_DB, dest_path)
+
+
+def clone_master_database(dest_path):
+    """Copy the read-only master seed into a private visitor SQLite file.
+
+    Copy into a temp file, then os.replace onto the destination so concurrent
+    requests never observe a half-written clone. sqlite3.backup is preferred
+    (consistent SQLite snapshot); shutil.copy2 is the fallback.
+    """
+    ensure_session_db_dir()
+    parent = os.path.dirname(dest_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    if not os.path.exists(MASTER_DB):
+        raise DemoWorkspaceError("Demo seed database is missing.")
+
+    tmp_path = f"{dest_path}.{uuid4().hex}.tmp"
+    try:
+        _copy_master_to(tmp_path)
+        for sidecar in (f"{dest_path}-wal", f"{dest_path}-shm"):
+            if os.path.exists(sidecar):
+                try:
+                    os.remove(sidecar)
+                except OSError:
+                    pass
+        try:
+            os.replace(tmp_path, dest_path)
+        except OSError:
+            # Windows can refuse replace while another handle is open.
+            shutil.copy2(tmp_path, dest_path)
+            _remove_sqlite_file(tmp_path)
+    except Exception:
+        _remove_sqlite_file(tmp_path)
+        raise
+
+    if not os.path.exists(dest_path) or sqlite_order_count(dest_path) <= 0:
+        _remove_sqlite_file(dest_path)
+        raise DemoWorkspaceError("Private demo workspace could not be initialized from the seed.")
+
+
+def visitor_db_needs_reclone(path):
+    """Reclone missing/empty/corrupt files — never wipe an active recruiter workspace."""
+    if not path or not os.path.exists(path):
+        return True
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return True
+    if size < 1024:
+        return True
+    # Empty warehouse = broken clone; active workspaces (even if modified) stay put.
+    return sqlite_order_count(path) <= 0
+
+
+def ensure_visitor_session_db(force_reset=False):
+    """Ensure this browser has a private SQLite clone. Never falls back to the shared seed for writes.
+
+    TTL recreate: if this visitor's clone is older than WMS_DEMO_SESSION_TTL_HOURS
+    (mtime / last activity), replace it from master and keep the same session ID
+    so the cookie stays valid. Simpler and correct vs issuing a new ID.
+    """
+    if not has_request_context():
+        raise DemoWorkspaceError("Visitor database requires an HTTP request context.")
+
+    session_id = get_demo_session_id()
+    path = session_db_path(session_id)
+
+    with _session_thread_lock(session_id):
+        expired = visitor_db_is_expired(path)
+        if visitor_db_needs_reclone(path) or force_reset or expired:
+            if not db_has_demo_baseline(MASTER_DB):
+                # Rebuild seed only — visitors never write the seed during normal ops.
+                ensure_bootstrap_demo_data(force_orders=True)
+            if not os.path.exists(MASTER_DB):
+                raise DemoWorkspaceError("Demo seed database is missing.")
+            try:
+                clone_master_database(path)
+            except DemoWorkspaceError:
+                raise
+            except Exception as exc:
+                _remove_sqlite_file(path)
+                raise DemoWorkspaceError(
+                    "Your private demo workspace could not be initialized. Please refresh and try again."
+                ) from exc
+
+        if not os.path.exists(path):
+            raise DemoWorkspaceError(
+                "Your private demo workspace could not be initialized. Please refresh and try again."
+            )
+
+        # Absolute safety: never allow resolving the master path as a visitor DB.
+        if os.path.abspath(path) == os.path.abspath(MASTER_DB):
+            raise DemoWorkspaceError("Refusing to bind visitor traffic to the shared seed database.")
+
+        touch_session_db(path)
+        g.demo_db_path = path
+        g.demo_session_id = session_id
+        return path
+
+
+def get_current_demo_db():
+    """Public helper: absolute path to the current visitor's private SQLite DB."""
+    return ensure_visitor_session_db()
+
+
+def resolve_db_path(use_master=False):
+    if use_master:
+        return MASTER_DB
+    if has_request_context():
+        cached = getattr(g, "demo_db_path", None)
+        if cached:
+            return cached
+        return ensure_visitor_session_db()
+    # Outside requests (CLI/bootstrap only) — never used by HTTP handlers.
+    return MASTER_DB
+
 
 # helper to centralize connection settings (timeout + thread sharing)
-def get_conn():
-    conn = sqlite3.connect(DB, timeout=10, check_same_thread=False)
+def get_conn(use_master=False):
+    db_path = resolve_db_path(use_master=use_master)
+    if (not use_master) and has_request_context():
+        if os.path.abspath(db_path) == os.path.abspath(MASTER_DB):
+            raise DemoWorkspaceError("Refusing shared-seed connection for visitor request.")
+    conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
     ensure_runtime_schema(conn)
     return conn
+
+
+def reset_visitor_demo_data():
+    """Restore ONLY this browser visitor from the clean master seed."""
+    # Ensure shared master is the 82-order baseline before recloning.
+    ensure_bootstrap_demo_data(force_orders=False)
+    if not db_has_demo_baseline(MASTER_DB):
+        ensure_bootstrap_demo_data(force_orders=True)
+    ensure_visitor_session_db(force_reset=True)
+    return {
+        "reset": True,
+        "session_id": session.get("demo_session_id", ""),
+        "orders": sqlite_order_count(session_db_path()),
+    }
 
 
 def get_runtime_config(default_port):
@@ -117,7 +487,7 @@ def prepare_runtime_port(host, preferred_port, script_path):
     terminated_pids = terminate_other_wms_processes(script_path)
     if terminated_pids:
         print(
-            "Stopped stale Enterprise WMS process(es): "
+            "Stopped stale DigiTech WMS process(es): "
             + ", ".join(str(pid) for pid in terminated_pids)
         )
         deadline = time.time() + 3
@@ -144,8 +514,12 @@ def find_available_port(host, preferred_port, max_attempts=20):
 
 
 def log_inventory_transaction(conn, tx_code, order_number, sku, warehouse, location,
-                              qty_change, qty_before, qty_after, user_role, notes=""):
+                              qty_change, qty_before, qty_after, user_role, notes="",
+                              tx_time=None):
     c = conn.cursor()
+    resolved_tx_time = tx_time.isoformat() if isinstance(tx_time, datetime) else (
+        clean_display_text(tx_time, "") or now_pt().isoformat()
+    )
     c.execute("""
         INSERT INTO inventory_transactions (
             tx_time,
@@ -162,7 +536,7 @@ def log_inventory_transaction(conn, tx_code, order_number, sku, warehouse, locat
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        now_pt().isoformat(),
+        resolved_tx_time,
         tx_code,
         order_number,
         sku,
@@ -260,6 +634,29 @@ def get_best_inventory_location(conn, sku, source_wh):
         clean_display_text(location, "Unassigned"),
         int(quantity or 0),
     )
+
+
+def get_available_inventory_qty(conn, sku, source_wh=None):
+    """Total on-hand quantity for a SKU at the source warehouse (planner ATP check)."""
+    c = conn.cursor()
+    warehouse = clean_display_text(source_wh, SOURCE_WAREHOUSE) or SOURCE_WAREHOUSE
+    source_text, source_text_like, source_city_like, source_code_like = build_warehouse_filters(warehouse)
+    c.execute(
+        """
+        SELECT COALESCE(SUM(quantity), 0)
+        FROM inventory
+        WHERE sku = ?
+          AND (
+            warehouse = ?
+            OR warehouse LIKE ?
+            OR warehouse LIKE ?
+            OR warehouse LIKE ?
+          )
+        """,
+        (sku, source_text, source_text_like, source_city_like, source_code_like),
+    )
+    row = c.fetchone()
+    return int(row[0] or 0) if row else 0
 
 
 def build_inventory_action_url(sku, warehouse="", location=""):
@@ -439,10 +836,34 @@ def calculate_sla_status(order_time, urgency, now=None):
 
 SOURCE_WAREHOUSE = "San Diego Warehouse 100"
 DESTINATION_WAREHOUSES = [
+    "San Diego Warehouse 100",
     "Los Angeles Warehouse 200",
     "San Francisco Warehouse 300",
     "San Bernardino Warehouse 400",
 ]
+WAREHOUSE_NETWORK = [
+    "San Diego Warehouse 100",
+    "Los Angeles Warehouse 200",
+    "San Francisco Warehouse 300",
+    "San Bernardino Warehouse 400",
+]
+WAREHOUSE_ALIASES = {
+    "san diego": SOURCE_WAREHOUSE,
+    "san diego warehouse": SOURCE_WAREHOUSE,
+    "san diego warehouse 100": SOURCE_WAREHOUSE,
+    "los angeles": "Los Angeles Warehouse 200",
+    "los angeles warehouse": "Los Angeles Warehouse 200",
+    "los angeles warehouse 200": "Los Angeles Warehouse 200",
+    "san francisco": "San Francisco Warehouse 300",
+    "san francisco warehouse": "San Francisco Warehouse 300",
+    "san francisco warehouse 300": "San Francisco Warehouse 300",
+    "san bernardino": "San Bernardino Warehouse 400",
+    "san bernadino": "San Bernardino Warehouse 400",
+    "san bernardino warehouse": "San Bernardino Warehouse 400",
+    "san bernadino warehouse": "San Bernardino Warehouse 400",
+    "san bernardino warehouse 400": "San Bernardino Warehouse 400",
+    "san bernadino warehouse 400": "San Bernardino Warehouse 400",
+}
 
 ISSUE_ROOT_CAUSES = [
     "Picker Error",
@@ -465,7 +886,7 @@ BLOCKED_ORDER_STATUS = "Blocked"
 SHORTAGE_ISSUE_TYPE = "Inventory Shortage"
 
 ISSUE_ATTACHMENT_DIR = os.path.join(BASE_DIR, "issue_attachments")
-DEFAULT_INVENTORY_WAREHOUSE = "San Diego"
+DEFAULT_INVENTORY_WAREHOUSE = SOURCE_WAREHOUSE
 DEFAULT_INVENTORY_LOCATION = "F01"
 PICKER_ROSTER = [
     "Maria Alvarez",
@@ -513,6 +934,81 @@ def build_operations_redirect_url(picker, message="", message_type="success"):
         params["ops_message"] = message
         params["ops_message_type"] = "warning" if message_type == "warning" else "success"
     return f"/operations?{urlencode(params)}"
+
+
+def apply_operations_worklist_filters(
+    items,
+    *,
+    search="",
+    status="",
+    urgency="",
+    assigned_picker="",
+    warehouse="",
+):
+    """Filter Operations worklist cards (visitor DB data already loaded). KPI tiles stay unfiltered."""
+    search_text = clean_display_text(search, "").strip().lower()
+    status_key = clean_display_text(status, "").strip().lower()
+    urgency_key = normalize_urgency(urgency, "") if clean_display_text(urgency, "") else ""
+    picker_key = clean_display_text(assigned_picker, "").strip().lower()
+    warehouse_key = canonicalize_warehouse_name(warehouse, "") if clean_display_text(warehouse, "") else ""
+    if warehouse_key and warehouse_key not in WAREHOUSE_NETWORK:
+        warehouse_key = ""
+
+    filtered = []
+    for card in items:
+        if urgency_key and card.get("priority_label") != urgency_key:
+            continue
+
+        if warehouse_key:
+            card_warehouse = canonicalize_warehouse_name(card.get("source_warehouse", ""), "")
+            if card_warehouse != warehouse_key:
+                continue
+
+        if picker_key:
+            card_picker = clean_display_text(card.get("assigned_picker", ""), "").strip().lower()
+            if not card_picker or card_picker != picker_key:
+                continue
+
+        if status_key:
+            stage_key = card.get("stage_key", "")
+            status_label = clean_display_text(card.get("status_label", ""), "")
+            raw_status = clean_display_text(card.get("raw_status", ""), "")
+            if status_key in {"ready", "orders placed"}:
+                if stage_key != "ready":
+                    continue
+            elif status_key in {"picking", "in_progress", "picking in progress"}:
+                if stage_key != "in_progress":
+                    continue
+            elif status_key in {"pending verification", "pending_verification"}:
+                if stage_key != "completed" or status_label != "Pending Verification":
+                    continue
+            elif status_key == "completed":
+                if stage_key != "completed" or status_label != "Completed":
+                    continue
+            elif status_key in {"quality issue", "quality_issue"}:
+                if stage_key != "completed" or status_label != "Quality Issue":
+                    continue
+            elif status_key == "blocked":
+                # Blocked shortage orders live in the alert panel, not the worklist.
+                continue
+            elif status_key not in {stage_key, status_label.lower(), raw_status.lower()}:
+                continue
+
+        if search_text:
+            sku_blob = " ".join(card.get("sku_list") or []).lower()
+            haystack = " ".join(
+                [
+                    clean_display_text(card.get("order_number"), ""),
+                    clean_display_text(card.get("picker_display"), ""),
+                    clean_display_text(card.get("assigned_picker"), ""),
+                    sku_blob,
+                ]
+            ).lower()
+            if search_text not in haystack:
+                continue
+
+        filtered.append(card)
+    return filtered
 
 
 def build_pick_screen_url(order_number, picker, message="", message_type="success"):
@@ -615,6 +1111,15 @@ def has_valid_inventory_assignment(value):
     return text != ""
 
 
+def canonicalize_warehouse_name(value, fallback=SOURCE_WAREHOUSE):
+    text = clean_display_text(value, "")
+    if not text:
+        return fallback
+    if text in WAREHOUSE_NETWORK:
+        return text
+    return WAREHOUSE_ALIASES.get(text.lower(), fallback)
+
+
 def normalize_inventory_assignments(conn):
     c = conn.cursor()
     c.execute(
@@ -632,7 +1137,26 @@ def normalize_inventory_assignments(conn):
         """,
         (DEFAULT_INVENTORY_WAREHOUSE, DEFAULT_INVENTORY_LOCATION),
     )
-    return c.rowcount
+    updated_rows = c.rowcount
+
+    # Collapse misspellings / short labels into the canonical 4-warehouse network.
+    c.execute(
+        """
+        SELECT DISTINCT warehouse
+        FROM inventory
+        WHERE TRIM(COALESCE(warehouse, '')) <> ''
+        """
+    )
+    for (warehouse_name,) in c.fetchall():
+        canonical = canonicalize_warehouse_name(warehouse_name, warehouse_name)
+        if canonical != warehouse_name and canonical in WAREHOUSE_NETWORK:
+            c.execute(
+                "UPDATE inventory SET warehouse = ? WHERE warehouse = ?",
+                (canonical, warehouse_name),
+            )
+            updated_rows += c.rowcount
+
+    return updated_rows
 
 
 def ensure_quality_audit_schema(conn):
@@ -774,6 +1298,64 @@ def ensure_order_header_pick_tracking_schema(conn):
     )
 
 
+def ensure_ask_wms_chat_schema(conn):
+    c = conn.cursor()
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ask_wms_conversations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ask_wms_chat (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id INTEGER,
+            created_at TEXT,
+            role TEXT,
+            message TEXT,
+            meta_json TEXT
+        )
+        """
+    )
+    c.execute("PRAGMA table_info(ask_wms_chat)")
+    columns = {row[1] for row in c.fetchall()}
+    if "conversation_id" not in columns:
+        c.execute("ALTER TABLE ask_wms_chat ADD COLUMN conversation_id INTEGER")
+
+    # Migrate legacy single-thread messages into one conversation if needed.
+    c.execute(
+        """
+        SELECT COUNT(*)
+        FROM ask_wms_chat
+        WHERE conversation_id IS NULL
+        """
+    )
+    legacy_count = int(c.fetchone()[0] or 0)
+    if legacy_count:
+        stamp = now_pt().isoformat()
+        c.execute(
+            """
+            INSERT INTO ask_wms_conversations (title, created_at, updated_at)
+            VALUES (?, ?, ?)
+            """,
+            ("Earlier conversation", stamp, stamp),
+        )
+        legacy_id = c.lastrowid
+        c.execute(
+            """
+            UPDATE ask_wms_chat
+            SET conversation_id = ?
+            WHERE conversation_id IS NULL
+            """,
+            (legacy_id,),
+        )
+
+
 def ensure_runtime_schema(conn):
     c = conn.cursor()
     c.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -785,6 +1367,7 @@ def ensure_runtime_schema(conn):
     if "quality_audits" in tables:
         ensure_quality_audit_schema(conn)
 
+    ensure_ask_wms_chat_schema(conn)
     conn.commit()
 
 
@@ -2474,9 +3057,12 @@ def seed_demo_inventory(conn, sku_count=120):
 
         for wh_index, warehouse in enumerate(warehouses):
             location = f"{location_prefixes[wh_index % len(location_prefixes)]}{(index % 12) + 1:02d}"
+            # Base band ~40–219 (+20 at source). Multiply for planner ATP headroom
+            # so demo users can place larger multi-line orders without hard-stop shortages.
             quantity = 40 + ((index * 7 + wh_index * 11) % 180)
             if warehouse == SOURCE_WAREHOUSE:
                 quantity += 20
+            quantity *= 4
 
             c.execute(
                 "INSERT INTO inventory VALUES (?, ?, ?, ?, ?)",
@@ -2486,38 +3072,265 @@ def seed_demo_inventory(conn, sku_count=120):
 
     return seeded_rows
 
-def ensure_bootstrap_demo_data():
-    conn = get_conn()
+def _demo_seed_dependencies():
+    # Plain dict (not an instance) so callables are not turned into bound methods.
+    return {
+        "seed_demo_inventory": seed_demo_inventory,
+        "SOURCE_WAREHOUSE": SOURCE_WAREHOUSE,
+        "DESTINATION_WAREHOUSES": DESTINATION_WAREHOUSES,
+        "PICKER_ROSTER": PICKER_ROSTER,
+        "log_inventory_transaction": log_inventory_transaction,
+        "get_best_inventory_location": get_best_inventory_location,
+        "create_supervisor_issue": create_supervisor_issue,
+        "build_issue_type": build_issue_type,
+        "SHORTAGE_ISSUE_TYPE": SHORTAGE_ISSUE_TYPE,
+        "shortage_issue_audit_id": shortage_issue_audit_id,
+        "calculate_sla_deadline": calculate_sla_deadline,
+    }
+
+
+def ensure_bootstrap_demo_data(force_orders: bool = False, purge_sessions: bool = False):
+    """Ensure inventory + the exact 82-order completed recruiter baseline exist on master.
+
+    When the master baseline is rebuilt (or purge_sessions=True), wipe demo_sessions/
+    so every browser reclones the fresh 82-order / 0-pending template on the next request.
+    Safe to call on every cold start (local or Render): never wipes a healthy baseline.
+    """
+    from wms_demo_seed import ensure_demo_order_baseline, DEMO_ORDER_COUNT, demo_baseline_present
+
+    conn = get_conn(use_master=True)
     c = conn.cursor()
 
     c.execute("SELECT COUNT(*) FROM inventory")
     inventory_count = int(c.fetchone()[0] or 0)
     c.execute("SELECT COUNT(*) FROM order_header")
     order_count = int(c.fetchone()[0] or 0)
+    baseline_ok = demo_baseline_present(conn)
 
     result = {
         "seeded_inventory_rows": 0,
         "seeded_orders": 0,
         "seeded_quality_escalations": 0,
+        "baseline_orders": order_count,
+        "target_orders": DEMO_ORDER_COUNT,
+        "purged_session_files": 0,
+        "reseeded": False,
+        "baseline_ok": baseline_ok,
     }
 
-    if inventory_count == 0:
+    deps = _demo_seed_dependencies()
+    needs_order_seed = force_orders or (not baseline_ok) or order_count != DEMO_ORDER_COUNT
+
+    # Full baseline rebuild reseeds inventory. Only top-up when empty and not rebuilding.
+    if inventory_count == 0 and not needs_order_seed:
         result["seeded_inventory_rows"] = seed_demo_inventory(conn)
         conn.commit()
 
+    seed_summary = ensure_demo_order_baseline(
+        conn,
+        force=bool(needs_order_seed),
+        dependencies=deps,
+    )
+    result["seed_summary"] = seed_summary
+    if seed_summary.get("seeded"):
+        result["reseeded"] = True
+        result["seeded_orders"] = int(seed_summary.get("orders_created") or 0)
+        result["seeded_quality_escalations"] = int(seed_summary.get("quality_issues") or 0)
+        result["seeded_inventory_rows"] = int(
+            seed_summary.get("inventory_rows") or result["seeded_inventory_rows"]
+        )
+    result["baseline_orders"] = int(
+        seed_summary.get("total_orders")
+        or sqlite_order_count(MASTER_DB)
+        or DEMO_ORDER_COUNT
+    )
+    result["baseline_ok"] = demo_baseline_present(conn)
+
+    conn.commit()
     conn.close()
+
+    # Stale visitor clones keep showing old pending-heavy data even when master is correct.
+    if purge_sessions or result["reseeded"] or not baseline_ok:
+        result["purged_session_files"] = purge_demo_session_databases()
+
     return result
 
-app = Flask(__name__)
 
-DB = os.path.join(BASE_DIR, "enterprise_wms.db")
+_APP_BOOTSTRAPPED = False
+
+
+def bootstrap_application(force_orders: bool = False, purge_sessions: bool = False):
+    """Idempotent cold-start bootstrap for local `python whs_mgmt.py` and gunicorn/Render.
+
+    Rebuilds the 82-order completed master baseline only when missing/off-baseline
+    (e.g. ephemeral disk wiped on Render restart). Never clears a healthy baseline.
+    """
+    global _APP_BOOTSTRAPPED
+    from wms_demo_seed import DEMO_ORDER_COUNT as _DEMO_ORDER_COUNT
+
+    ensure_session_db_dir()
+    migrate_legacy_db_to_master()
+    init_db()
+
+    try:
+        load_inventory()
+    except Exception as exc:
+        print(f"Warning: could not load inventory spreadsheet: {exc}")
+
+    master_orders = sqlite_order_count(MASTER_DB)
+    master_ok = db_has_demo_baseline(MASTER_DB)
+    stale_sessions = 0
+    ensure_session_db_dir()
+    for name in os.listdir(SESSION_DB_DIR):
+        if not name.endswith(".db"):
+            continue
+        session_path = os.path.join(SESSION_DB_DIR, name)
+        if os.path.isfile(session_path) and not db_has_demo_baseline(session_path):
+            stale_sessions += 1
+
+    bootstrap_result = ensure_bootstrap_demo_data(
+        force_orders=force_orders or (not master_ok) or master_orders != _DEMO_ORDER_COUNT,
+        purge_sessions=purge_sessions or (stale_sessions > 0) or (not master_ok),
+    )
+
+    if bootstrap_result.get("seeded_inventory_rows"):
+        print(
+            f"Seeded {bootstrap_result['seeded_inventory_rows']} demo inventory row(s) "
+            "for the recruiter baseline."
+        )
+    if bootstrap_result.get("seeded_orders"):
+        print(
+            f"Seeded {bootstrap_result['seeded_orders']} completed demo order(s) "
+            f"(0 pending) with {bootstrap_result['seeded_quality_escalations']} "
+            "historical quality exception(s)."
+        )
+    if bootstrap_result.get("purged_session_files"):
+        print(
+            f"Purged {bootstrap_result['purged_session_files']} stale demo_sessions file(s) "
+            "so visitors reclone the 82-order / 0-pending master."
+        )
+    print(
+        f"Master demo baseline ready: {bootstrap_result.get('baseline_orders', 0)} order(s) "
+        f"(target {_DEMO_ORDER_COUNT}, pending=0)."
+    )
+
+    conn = get_conn(use_master=True)
+    normalized_rows = normalize_inventory_assignments(conn)
+    normalized_urgency_rows = normalize_urgency_labels(conn)
+    if normalized_rows:
+        conn.commit()
+        print(
+            f"Normalized {normalized_rows} inventory row(s) with default assignment "
+            f"{DEFAULT_INVENTORY_WAREHOUSE}/{DEFAULT_INVENTORY_LOCATION}."
+        )
+    if normalized_urgency_rows:
+        conn.commit()
+        print(f"Normalized {normalized_urgency_rows} order urgency value(s) to Standard/Urgent/Critical.")
+
+    # With a completed-only baseline this is a no-op; kept for safety if data drifts.
+    startup_blocked_orders = enforce_quality_gate_on_pending_orders(conn)
+    if startup_blocked_orders:
+        conn.commit()
+        print(
+            "Quality gate remediation moved "
+            f"{len(startup_blocked_orders)} order(s) from Pending Verification to Picking in Progress."
+        )
+    conn.close()
+
+    _APP_BOOTSTRAPPED = True
+    return bootstrap_result
+
+
+app = Flask(__name__)
+# Production: set WMS_SECRET_KEY in the host environment. Never commit real secrets.
+_secret = os.environ.get("WMS_SECRET_KEY", "").strip()
+if not _secret:
+    # Ephemeral fallback for local/dev only — sessions reset when the process restarts.
+    _secret = secrets.token_hex(32)
+app.secret_key = _secret
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(seconds=max(DEMO_SESSION_TTL_SECONDS, 3600))
+app.config["SESSION_REFRESH_EACH_REQUEST"] = True
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+# Render terminates TLS; local http must keep Secure off so the cookie still sets.
+app.config["SESSION_COOKIE_SECURE"] = (
+    bool(os.environ.get("RENDER", "").strip())
+    or os.environ.get("WMS_SESSION_COOKIE_SECURE", "").strip().lower() in {"1", "true", "yes", "on"}
+)
 EXCEL_FILE = os.path.join(BASE_DIR, "WHS Management.xlsx")
+
+
+def _demo_cookie_secure():
+    if app.config.get("SESSION_COOKIE_SECURE"):
+        return True
+    if request.is_secure:
+        return True
+    proto = (request.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+    return proto == "https"
+
+
+@app.before_request
+def bind_isolated_demo_session():
+    # Static assets are unused in this monolith; still skip non-HTML noise safely.
+    if request.endpoint == "static":
+        return None
+    # gunicorn/Render never hit __main__; bootstrap on first request if needed.
+    if not _APP_BOOTSTRAPPED:
+        bootstrap_application()
+    try:
+        g.demo_db_path = ensure_visitor_session_db()
+        cleanup_stale_demo_sessions()
+    except DemoWorkspaceError as exc:
+        return (
+            f"""<!doctype html><html><head><title>Demo Workspace</title></head>
+<body style="font-family:Segoe UI,sans-serif;max-width:640px;margin:48px auto;padding:0 16px;">
+<h1>Private demo workspace unavailable</h1>
+<p>{html_escape(str(exc))}</p>
+<p><a href="/">Refresh and try again</a></p>
+</body></html>""",
+            503,
+        )
+    return None
+
+
+@app.after_request
+def set_demo_session_cookie(response):
+    """Persist the visitor session ID in a dedicated secure cookie aligned with TTL."""
+    if request.endpoint == "static":
+        return response
+    session_id = getattr(g, "demo_session_id", None) or session.get("demo_session_id")
+    if not validate_demo_session_id(session_id):
+        return response
+    response.set_cookie(
+        DEMO_SESSION_COOKIE,
+        session_id,
+        max_age=DEMO_SESSION_TTL_SECONDS,
+        httponly=True,
+        samesite="Lax",
+        secure=_demo_cookie_secure(),
+        path="/",
+    )
+    return response
+
+
+@app.errorhandler(DemoWorkspaceError)
+def handle_demo_workspace_error(exc):
+    return (
+        f"""<!doctype html><html><head><title>Demo Workspace</title></head>
+<body style="font-family:Segoe UI,sans-serif;max-width:640px;margin:48px auto;padding:0 16px;">
+<h1>Private demo workspace unavailable</h1>
+<p>{html_escape(str(exc))}</p>
+<p><a href="/">Refresh and try again</a></p>
+</body></html>""",
+        503,
+    )
 
 # ======================================================
 # DATABASE INITIALIZATION
 # ======================================================
 def init_db():
-    conn = get_conn()
+    # Always initialize the shared master template (not a visitor clone).
+    conn = get_conn(use_master=True)
     c = conn.cursor()
 
 
@@ -2609,6 +3422,7 @@ def init_db():
             last_updated_at TEXT
         )
     """)
+    ensure_ask_wms_chat_schema(conn)
 
     c.execute("""
         CREATE TRIGGER IF NOT EXISTS inventory_positive_insert_requires_assignment
@@ -2765,12 +3579,28 @@ def layout(content, body_class=""):
             position: sticky;
             top: 0;
             z-index: 10;
-            backdrop-filter: blur(14px);
             border-bottom: 1px solid rgba(217, 226, 236, 0.85);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 14px;
+            flex-wrap: wrap;
+        }
+        .nav-brand {
+            color: var(--ink-900);
+            font-weight: 800;
+            letter-spacing: -0.02em;
+            white-space: nowrap;
+        }
+        .nav-links {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 2px;
         }
         .nav a {
             color: var(--ink-700);
-            margin-right: 16px;
+            margin-right: 8px;
             text-decoration: none;
             font-weight: 600;
             padding: 8px 12px;
@@ -2778,6 +3608,236 @@ def layout(content, body_class=""):
             transition: background 0.18s ease, color 0.18s ease;
         }
         .nav a:hover {background: var(--accent-100); color: var(--accent-600);}
+        .nav-reset-form {display: inline; margin: 0;}
+        .nav-reset-btn {
+            background: #fff7ed;
+            color: #9a3412 !important;
+            border: 1px solid #fdba74;
+            box-shadow: none;
+            padding: 8px 12px;
+            border-radius: 999px;
+            font-weight: 700;
+            cursor: pointer;
+            margin-right: 0;
+        }
+        .nav-reset-btn:hover {background: #ffedd5; color: #7c2d12 !important;}
+        .demo-session-note {
+            margin: 0 0 18px 0;
+            padding: 10px 14px;
+            border-radius: 12px;
+            background: #eff6ff;
+            border: 1px solid #bfdbfe;
+            color: #1e3a8a;
+            font-size: 13px;
+            font-weight: 600;
+        }
+        .flash-warning {
+            margin: 0 0 18px 0;
+            padding: 14px 16px;
+            border-radius: 14px;
+            background: #fff7ed;
+            border: 1px solid #fdba74;
+            color: #9a3412;
+        }
+        .flash-warning ul {margin: 8px 0 0 18px; padding: 0;}
+        .ask-suggest {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 10px;
+        }
+        .ask-suggest button {
+            background: #eff6ff;
+            color: #1d4ed8;
+            border: 1px solid #bfdbfe;
+            box-shadow: none;
+            font-size: 12px;
+            padding: 7px 10px;
+        }
+        .ask-chip {
+            background: #f8fafc !important;
+            color: #334155 !important;
+            border: 1px solid #dbe4f0 !important;
+            border-radius: 999px !important;
+            box-shadow: none !important;
+            font-size: 12px !important;
+            padding: 6px 12px !important;
+            width: auto !important;
+        }
+        .ask-chip:hover {
+            background: #eff6ff !important;
+            color: #1d4ed8 !important;
+            border-color: #bfdbfe !important;
+        }
+        .ask-layout {
+            display: grid;
+            grid-template-columns: 260px minmax(0, 1fr);
+            gap: 16px;
+            align-items: stretch;
+            min-height: calc(100vh - 180px);
+        }
+        .ask-sidebar {
+            background: #fff;
+            border: 1px solid rgba(217, 226, 236, 0.9);
+            border-radius: 20px;
+            box-shadow: var(--shadow-soft);
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            max-height: calc(100vh - 180px);
+        }
+        .ask-sidebar-title {
+            margin: 0;
+            font-size: 15px;
+            font-weight: 800;
+            color: var(--ink-900);
+        }
+        .ask-new-chat {
+            width: 100%;
+            box-shadow: none;
+        }
+        .ask-conversation-list {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            overflow-y: auto;
+            flex: 1;
+            padding-right: 2px;
+        }
+        .ask-conversation-item {
+            display: block;
+            text-decoration: none;
+            color: var(--ink-900);
+            border: 1px solid #e2e8f0;
+            background: #f8fafc;
+            border-radius: 12px;
+            padding: 10px 12px;
+            font-size: 13px;
+            font-weight: 600;
+            line-height: 1.35;
+        }
+        .ask-conversation-item:hover {
+            background: #eff6ff;
+            border-color: #bfdbfe;
+            color: #1d4ed8;
+        }
+        .ask-conversation-item.active {
+            background: #eff6ff;
+            border-color: #93c5fd;
+            color: #1d4ed8;
+        }
+        .ask-conversation-meta {
+            display: block;
+            margin-top: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            color: #94a3b8;
+        }
+        .ask-chat-shell {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            background: #fff;
+            border: 1px solid rgba(217, 226, 236, 0.9);
+            border-radius: 20px;
+            box-shadow: var(--shadow-soft);
+            padding: 18px;
+            min-height: calc(100vh - 180px);
+        }
+        .ask-chat-log {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            flex: 1;
+            max-height: none;
+            min-height: 360px;
+            overflow-y: auto;
+            padding: 4px 2px 8px 2px;
+        }
+        .ask-bubble {
+            border-radius: 16px;
+            padding: 12px 14px;
+            border: 1px solid #dbe4f0;
+            background: #fff;
+            max-width: 88%;
+        }
+        .ask-bubble.user {
+            align-self: flex-end;
+            background: #eff6ff;
+            border-color: #bfdbfe;
+        }
+        .ask-bubble.assistant {
+            align-self: flex-start;
+            background: #f8fafc;
+        }
+        .ask-bubble-role {
+            font-size: 11px;
+            font-weight: 800;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            color: #64748b;
+            margin-bottom: 6px;
+        }
+        .ask-bubble-time {
+            margin-top: 8px;
+            font-size: 11px;
+            color: #94a3b8;
+        }
+        .ask-headline {
+            margin: 0;
+            font-size: 15px;
+            font-weight: 700;
+            color: #0f172a;
+            line-height: 1.5;
+        }
+        .ask-bullets {
+            margin: 10px 0 0 0;
+            padding-left: 18px;
+            color: #334155;
+        }
+        .ask-bullets li {margin: 4px 0;}
+        .ask-followup {
+            margin: 10px 0 0 0;
+            font-size: 13px;
+            color: #475569;
+        }
+        .ask-composer {
+            display: grid;
+            gap: 10px;
+            border-top: 1px solid #eef2f7;
+            padding-top: 12px;
+        }
+        .ask-composer textarea {
+            min-height: 72px;
+            resize: vertical;
+        }
+        .ask-composer-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .ask-page-header {
+            margin-bottom: 14px;
+        }
+        .ask-page-header h1 {
+            margin: 0 0 4px 0;
+            font-size: 28px;
+        }
+        .ask-empty {
+            margin: auto;
+            text-align: center;
+            color: #64748b;
+            max-width: 420px;
+            padding: 40px 12px;
+        }
+        @media (max-width: 980px) {
+            .ask-layout {grid-template-columns: 1fr;}
+            .ask-sidebar {max-height: 240px;}
+            .ask-chat-shell, .ask-sidebar {min-height: 0;}
+        }
         .container {
             padding: 32px 40px 48px 40px;
             max-width: 1440px;
@@ -3503,6 +4563,7 @@ def layout(content, body_class=""):
             display: flex;
             flex-direction: column;
             gap: 8px;
+            position: relative;
         }
         .filter-label {
             font-size: 12px;
@@ -3510,6 +4571,23 @@ def layout(content, body_class=""):
             color: var(--ink-500);
             text-transform: uppercase;
             letter-spacing: 0.06em;
+        }
+        .filter-field select,
+        .filter-field input {
+            width: 100%;
+            min-height: 42px;
+            padding: 10px 12px;
+            border: 1px solid #cbd5e1;
+            border-radius: 12px;
+            background: #fff;
+            color: var(--ink-900);
+            font: inherit;
+        }
+        .filter-field select:focus,
+        .filter-field input:focus {
+            outline: none;
+            border-color: #93c5fd;
+            box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.12);
         }
         .filter-foot {
             display: flex;
@@ -4460,14 +5538,15 @@ def layout(content, body_class=""):
     </head>
     <body class="__BODY_CLASS__">
     <div class="nav">
-        <b style="color:var(--ink-900);">Enterprise WMS</b>
-        <div>
+        <span class="nav-brand">DigiTech WMS</span>
+        <div class="nav-links">
             <a href="/executive">Warehouse Executive Dashboard</a>
-            <a href="/planner">Planner</a>
+            <a href="/planner">Order Planning</a>
             <a href="/inventory">Inventory</a>
             <a href="/operations">Operations</a>
             <a href="/quality">Quality</a>
             <a href="/supervisor">Supervisor</a>
+            <a href="/ask-wms">Ask WMS</a>
         </div>
     </div>
 
@@ -4491,6 +5570,1347 @@ def dashboard():
     # Keep backward compatibility for / and /dashboard while using one
     # canonical dashboard implementation under /executive.
     return redirect("/executive")
+
+
+@app.route("/reset-demo", methods=["POST", "GET"])
+def reset_demo():
+    reset_visitor_demo_data()
+    return redirect("/executive?demo_reset=1")
+
+
+def build_ops_snapshot(conn):
+    c = conn.cursor()
+    snapshot = {
+        "orders_total": 0,
+        "orders_placed": 0,
+        "picking": 0,
+        "pending_verification": 0,
+        "completed": 0,
+        "blocked": 0,
+        "quality_issue": 0,
+        "open_quality_issues": 0,
+        "open_shortage_issues": 0,
+        "sku_count": 0,
+        "units_on_hand": 0,
+        "inventory_value": 0.0,
+        "sla_healthy": 0,
+        "sla_at_risk": 0,
+        "sla_breached": 0,
+        "audits_total": 0,
+        "audits_passed": 0,
+        "audits_failed": 0,
+    }
+
+    c.execute("SELECT status, COUNT(*) FROM order_header GROUP BY status")
+    for status, count in c.fetchall():
+        snapshot["orders_total"] += int(count or 0)
+        key_map = {
+            "Orders Placed": "orders_placed",
+            "Picking in Progress": "picking",
+            "Pending Verification": "pending_verification",
+            "Completed": "completed",
+            "Blocked": "blocked",
+            "Quality Issue": "quality_issue",
+        }
+        mapped = key_map.get(clean_display_text(status, ""))
+        if mapped:
+            snapshot[mapped] = int(count or 0)
+
+    c.execute(
+        """
+        SELECT COUNT(*)
+        FROM supervisor_quality_issues
+        WHERE issue_status NOT IN ('Closed', 'Resolved')
+          AND COALESCE(issue_type, '') != ?
+        """,
+        (SHORTAGE_ISSUE_TYPE,),
+    )
+    snapshot["open_quality_issues"] = int(c.fetchone()[0] or 0)
+
+    c.execute(
+        """
+        SELECT COUNT(*)
+        FROM supervisor_quality_issues
+        WHERE issue_status NOT IN ('Closed', 'Resolved')
+          AND COALESCE(issue_type, '') = ?
+        """,
+        (SHORTAGE_ISSUE_TYPE,),
+    )
+    snapshot["open_shortage_issues"] = int(c.fetchone()[0] or 0)
+
+    c.execute("SELECT COUNT(DISTINCT sku), COALESCE(SUM(quantity), 0) FROM inventory WHERE quantity > 0")
+    sku_count, units = c.fetchone()
+    snapshot["sku_count"] = int(sku_count or 0)
+    snapshot["units_on_hand"] = int(units or 0)
+
+    c.execute("SELECT COALESCE(SUM(CAST(quantity AS REAL) * price), 0) FROM inventory WHERE quantity > 0")
+    snapshot["inventory_value"] = float(c.fetchone()[0] or 0)
+
+    c.execute("SELECT COUNT(*) FROM quality_audits")
+    snapshot["audits_total"] = int(c.fetchone()[0] or 0)
+    c.execute("SELECT COUNT(*) FROM quality_audits WHERE result IN ('Pass', 'Passed')")
+    snapshot["audits_passed"] = int(c.fetchone()[0] or 0)
+    c.execute("SELECT COUNT(*) FROM quality_audits WHERE result='Failed'")
+    snapshot["audits_failed"] = int(c.fetchone()[0] or 0)
+
+    now = now_pt()
+    c.execute("SELECT urgency, status, date FROM order_header WHERE status != 'Completed'")
+    for urgency, status, date_str in c.fetchall():
+        try:
+            order_time = parse_order_datetime(date_str)
+            sla_key, _ = calculate_sla_status(order_time, normalize_urgency(urgency, "Standard"), now)
+        except Exception:
+            continue
+        if sla_key == "healthy":
+            snapshot["sla_healthy"] += 1
+        elif sla_key == "at_risk":
+            snapshot["sla_at_risk"] += 1
+        else:
+            snapshot["sla_breached"] += 1
+
+    return snapshot
+
+
+def create_ask_wms_conversation(conn, title="New conversation"):
+    c = conn.cursor()
+    stamp = now_pt().isoformat()
+    c.execute(
+        """
+        INSERT INTO ask_wms_conversations (title, created_at, updated_at)
+        VALUES (?, ?, ?)
+        """,
+        (clean_display_text(title, "New conversation")[:80], stamp, stamp),
+    )
+    return c.lastrowid
+
+
+def list_ask_wms_conversations(conn, limit=40):
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT id, title, created_at, updated_at
+        FROM ask_wms_conversations
+        ORDER BY datetime(updated_at) DESC, id DESC
+        LIMIT ?
+        """,
+        (max(1, int(limit)),),
+    )
+    return [
+        {
+            "id": row[0],
+            "title": clean_display_text(row[1], "Conversation"),
+            "created_at": row[2],
+            "updated_at": row[3],
+        }
+        for row in c.fetchall()
+    ]
+
+
+def get_ask_wms_conversation(conn, conversation_id):
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT id, title, created_at, updated_at
+        FROM ask_wms_conversations
+        WHERE id = ?
+        """,
+        (conversation_id,),
+    )
+    row = c.fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "title": clean_display_text(row[1], "Conversation"),
+        "created_at": row[2],
+        "updated_at": row[3],
+    }
+
+
+def touch_ask_wms_conversation(conn, conversation_id, title=None):
+    c = conn.cursor()
+    if title:
+        c.execute(
+            """
+            UPDATE ask_wms_conversations
+            SET title = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (clean_display_text(title, "Conversation")[:80], now_pt().isoformat(), conversation_id),
+        )
+    else:
+        c.execute(
+            """
+            UPDATE ask_wms_conversations
+            SET updated_at = ?
+            WHERE id = ?
+            """,
+            (now_pt().isoformat(), conversation_id),
+        )
+
+
+def save_ask_wms_message(conn, conversation_id, role, message, meta=None):
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO ask_wms_chat (conversation_id, created_at, role, message, meta_json)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            conversation_id,
+            now_pt().isoformat(),
+            clean_display_text(role, "assistant"),
+            message or "",
+            json.dumps(meta or {}),
+        ),
+    )
+    touch_ask_wms_conversation(conn, conversation_id)
+
+
+def list_ask_wms_chat(conn, conversation_id, limit=120):
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT id, created_at, role, message, meta_json
+        FROM ask_wms_chat
+        WHERE conversation_id = ?
+        ORDER BY id ASC
+        LIMIT ?
+        """,
+        (conversation_id, max(1, int(limit))),
+    )
+    rows = []
+    for row_id, created_at, role, message, meta_json in c.fetchall():
+        try:
+            meta = json.loads(meta_json) if meta_json else {}
+        except Exception:
+            meta = {}
+        rows.append(
+            {
+                "id": row_id,
+                "created_at": created_at,
+                "role": clean_display_text(role, "assistant"),
+                "message": message or "",
+                "meta": meta if isinstance(meta, dict) else {},
+            }
+        )
+    return rows
+
+
+def clear_ask_wms_chat(conn, conversation_id=None):
+    c = conn.cursor()
+    if conversation_id:
+        c.execute("DELETE FROM ask_wms_chat WHERE conversation_id = ?", (conversation_id,))
+        c.execute("DELETE FROM ask_wms_conversations WHERE id = ?", (conversation_id,))
+    else:
+        c.execute("DELETE FROM ask_wms_chat")
+        c.execute("DELETE FROM ask_wms_conversations")
+    return c.rowcount
+
+
+def compose_ask_response(headline, bullets=None, follow_up=""):
+    safe_headline = html_escape(clean_display_text(headline, ""))
+    html = f"<p class='ask-headline'>{safe_headline}</p>"
+    clean_bullets = [clean_display_text(item, "") for item in (bullets or []) if clean_display_text(item, "")]
+    if clean_bullets:
+        items = "".join(f"<li>{html_escape(item)}</li>" for item in clean_bullets[:5])
+        html += f"<ul class='ask-bullets'>{items}</ul>"
+    if follow_up:
+        html += f"<p class='ask-followup'><strong>Next:</strong> {html_escape(clean_display_text(follow_up, ''))}</p>"
+    return html
+
+
+def normalize_ask_question(question):
+    text = clean_display_text(question, "").lower()
+    text = text.replace("on-hand", "on hand").replace("onhand", "on hand")
+    text = re.sub(r"[^\w\s/\-:]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    spelling_map = {
+        "shiped": "shipped",
+        "shippd": "shipped",
+        "shiiped": "shipped",
+        "completd": "completed",
+        "recieved": "received",
+        "recive": "received",
+        "inventroy": "inventory",
+        "inventor": "inventory",
+        "avaliable": "available",
+        "availible": "available",
+        "quanity": "quantity",
+        "qantity": "quantity",
+        "qty": "quantity",
+        "superviser": "supervisor",
+        "supervisr": "supervisor",
+        "verificaton": "verification",
+        "verfication": "verification",
+        "pendng": "pending",
+        "blockd": "blocked",
+        "shortge": "shortage",
+        "shortages": "shortage",
+        "pickers": "picker",
+        "orders": "order",
+        "skus": "sku",
+        "parts": "part",
+        "pn": "part",
+        "procurement": "planner",
+        "dashbord": "dashboard",
+        "exective": "executive",
+        "tommorow": "tomorrow",
+        "yesturday": "yesterday",
+    }
+    tokens = []
+    for token in text.split():
+        tokens.append(spelling_map.get(token, token))
+    return " ".join(tokens)
+
+
+def extract_ask_sku(normalized_question, original_question=""):
+    for source in (original_question, normalized_question):
+        match = re.search(r"\b(?:sku|part|item|pn)?\s*#?\s*([0-9]{4,6})\b", source, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def extract_ask_date(normalized_question):
+    now = now_pt()
+    q = normalized_question
+
+    if "today" in q:
+        return now.date(), "today"
+    if "yesterday" in q:
+        return (now - timedelta(days=1)).date(), "yesterday"
+
+    iso_match = re.search(r"\b(20\d{2})-(\d{1,2})-(\d{1,2})\b", q)
+    if iso_match:
+        year, month, day = map(int, iso_match.groups())
+        try:
+            return datetime(year, month, day, tzinfo=PACIFIC_TZ).date(), f"{year:04d}-{month:02d}-{day:02d}"
+        except ValueError:
+            pass
+
+    us_match = re.search(r"\b(\d{1,2})/(\d{1,2})/(20\d{2})\b", q)
+    if us_match:
+        month, day, year = map(int, us_match.groups())
+        try:
+            return datetime(year, month, day, tzinfo=PACIFIC_TZ).date(), f"{year:04d}-{month:02d}-{day:02d}"
+        except ValueError:
+            pass
+
+    month_map = {
+        "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+        "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+        "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+        "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+    }
+    month_match = re.search(
+        r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|"
+        r"aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+        r"\s+(\d{1,2})(?:,?\s*(20\d{2}))?\b",
+        q,
+    )
+    if month_match:
+        month_token = month_match.group(1)
+        month = month_map.get(month_token) or month_map.get(month_token[:3])
+        day = int(month_match.group(2))
+        year = int(month_match.group(3) or now.year)
+        if month:
+            try:
+                return datetime(year, month, day, tzinfo=PACIFIC_TZ).date(), f"{year:04d}-{month:02d}-{day:02d}"
+            except ValueError:
+                pass
+
+    return None, ""
+
+
+def extract_requested_qty(normalized_question):
+    patterns = [
+        r"\b(?:for|of|need|needs|request(?:ing)?|order(?:ing)?)\s+(\d{1,6})\b",
+        r"\b(\d{1,6})\s+(?:units?|parts?|qty|quantity)\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, normalized_question)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def classify_ask_intent(normalized_question):
+    q = normalized_question
+    scores = {
+        "summary": 0,
+        "executive": 0,
+        "planner": 0,
+        "inventory": 0,
+        "operations": 0,
+        "quality": 0,
+        "supervisor": 0,
+        "unknown": 0,
+    }
+
+    def bump(intent, weight=1):
+        scores[intent] += weight
+
+    if any(token in q for token in ("summary", "summarize", "overview", "snapshot", "executive dashboard", "how is the warehouse")):
+        bump("summary", 4)
+    if any(token in q for token in ("dashboard", "kpi", "sla", "shipped", "received", "pending order", "inventory value")):
+        bump("executive", 3)
+    if any(token in q for token in ("planner", "procurement", "destination", "urgency", "can we order", "support a request")):
+        bump("planner", 3)
+    if any(token in q for token in ("inventory", "stock", "on hand", "available", "part", "sku", "low stock", "overstock", "warehouse value", "most", "least", "highest", "lowest", "top")):
+        bump("inventory", 3)
+    if any(token in q for token in ("most inventory", "highest stock", "top sku", "part number", "which part", "which sku")):
+        bump("inventory", 4)
+    if any(token in q for token in ("operation", "picker", "picking", "blocked", "shortage", "workboard", "workload", "behind")):
+        bump("operations", 3)
+    if any(token in q for token in ("quality", "verification", "audit", "qa", "defect", "damage", "pass rate")):
+        bump("quality", 3)
+    if any(token in q for token in ("supervisor", "escalation", "root cause", "corrective")):
+        bump("supervisor", 3)
+
+    if "shipped" in q or "completed" in q:
+        bump("executive", 2)
+    if "blocked" in q or "shortage" in q:
+        bump("operations", 2)
+    if "verification" in q:
+        bump("quality", 2)
+
+    best_intent = max(scores, key=scores.get)
+    if scores[best_intent] <= 0:
+        return "unknown"
+    return best_intent
+
+
+def _ask_date_bounds(day_value):
+    start = datetime(day_value.year, day_value.month, day_value.day, tzinfo=PACIFIC_TZ)
+    end = start + timedelta(days=1)
+    return start.isoformat(), end.isoformat()
+
+
+def extract_ask_top_n(normalized_question, default=1):
+    match = re.search(r"\btop\s+(\d{1,2})\b", normalized_question)
+    if match:
+        return max(1, min(int(match.group(1)), 20))
+    if any(token in normalized_question for token in ("top", "runners up", "runner up", "leaderboard")):
+        return 5
+    return default
+
+
+def detect_inventory_ranking_intent(normalized_question):
+    q = normalized_question
+    inventoryish = any(
+        token in q
+        for token in ("inventory", "stock", "on hand", "part", "sku", "item", "quantity", "units")
+    )
+    mostish = any(token in q for token in ("most", "highest", "largest", "greatest", "top", "biggest"))
+    leastish = any(token in q for token in ("least", "lowest", "smallest", "fewest", "minimum"))
+    valueish = "value" in q or "dollar" in q or "worth" in q
+    which_part = ("which" in q or "what" in q) and any(token in q for token in ("part", "sku", "item"))
+    if not inventoryish and not which_part:
+        return None
+    if leastish:
+        return "least_qty"
+    if valueish and (mostish or "top" in q or which_part):
+        return "most_value"
+    if mostish or which_part:
+        return "most_qty"
+    return None
+
+
+def query_sku_inventory_ranks(conn, mode="most_qty", limit=5):
+    c = conn.cursor()
+    limit = max(1, min(int(limit or 5), 20))
+    if mode == "most_value":
+        order_sql = "ORDER BY val DESC, qty DESC, sku ASC"
+    elif mode == "least_qty":
+        order_sql = "ORDER BY qty ASC, sku ASC"
+    else:
+        order_sql = "ORDER BY qty DESC, val DESC, sku ASC"
+
+    c.execute(
+        f"""
+        SELECT
+            sku,
+            COALESCE(SUM(quantity), 0) AS qty,
+            COALESCE(SUM(CAST(quantity AS REAL) * price), 0) AS val
+        FROM inventory
+        WHERE quantity > 0
+          AND TRIM(COALESCE(sku, '')) <> ''
+        GROUP BY sku
+        {order_sql}
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    rows = []
+    for sku, qty, val in c.fetchall():
+        rows.append(
+            {
+                "sku": clean_display_text(sku, ""),
+                "qty": int(qty or 0),
+                "value": float(val or 0),
+                "description": sku_semiconductor_description(sku),
+            }
+        )
+    return rows
+
+
+def answer_ask_wms(conn, question, prior_context=None, debug=False):
+    """Executive Ask WMS entrypoint: zero-paid-API intent engine over session DB."""
+    import wms_ask_engine
+
+    answer_html, snapshot, context = wms_ask_engine.answer_question(
+        conn,
+        question,
+        prior_context=prior_context or {},
+        warehouses=list(WAREHOUSE_NETWORK),
+        source_warehouse=SOURCE_WAREHOUSE,
+        low_stock_threshold=DEFAULT_LOW_STOCK_ALERT_THRESHOLD,
+        shortage_issue_type=SHORTAGE_ISSUE_TYPE,
+        picker_roster=list(PICKER_ROSTER),
+        now_pt=now_pt,
+        parse_order_datetime=parse_order_datetime,
+        normalize_urgency=normalize_urgency,
+        calculate_sla_status=calculate_sla_status,
+        calculate_sla_deadline=calculate_sla_deadline,
+        sku_description=sku_semiconductor_description,
+        debug=debug,
+    )
+    return answer_html, snapshot, context
+
+
+def _answer_ask_wms_legacy(conn, question):
+    original = clean_display_text(question, "")
+    q = normalize_ask_question(original)
+    # Keep multi-word phrases useful for ranking detection.
+    q = q.replace("part number", "part").replace("part no", "part").replace("item number", "part")
+    c = conn.cursor()
+    snapshot = build_ops_snapshot(conn)
+
+    if not q:
+        return compose_ask_response(
+            "Ask a warehouse question and I will answer from this demo session's live data.",
+            [
+                "Try shipped counts by date, SKU availability, blocked orders, quality queues, or SLA risk.",
+            ],
+            "Ask: How many orders shipped today?",
+        ), snapshot, {"intent": "unknown"}
+
+    sku_value = extract_ask_sku(q, original)
+    day_value, day_label = extract_ask_date(q)
+    requested_qty = extract_requested_qty(q)
+    intent = classify_ask_intent(q)
+    ranking_mode = detect_inventory_ranking_intent(q)
+    top_n = extract_ask_top_n(q, default=5 if "top" in q else 1)
+    meta = {"intent": intent, "sku": sku_value, "date": day_label, "ranking": ranking_mode}
+
+    # Catalog-level SKU count ("how many SKUs available/active?")
+    asks_sku_catalog_count = (
+        not sku_value
+        and "sku" in q
+        and (
+            "how many" in q
+            or "number of" in q
+            or "count of" in q
+            or q.startswith("sku available")
+            or "skus available" in original.lower()
+        )
+        and any(
+            token in q
+            for token in (
+                "available",
+                "active",
+                "total",
+                "in inventory",
+                "in stock",
+                "do we have",
+                "are there",
+                "have",
+            )
+        )
+    )
+    if asks_sku_catalog_count or (not sku_value and re.search(r"\bhow many sku\b", q)):
+        return compose_ask_response(
+            f"There are {snapshot['sku_count']} active SKUs available in this demo warehouse.",
+            [
+                f"Total units on hand: {snapshot['units_on_hand']:,}",
+                f"Inventory value: ${snapshot['inventory_value']:,.2f}",
+            ],
+            "Ask which part number has the most inventory.",
+        ), snapshot, {"intent": "inventory", "sku": ""}
+
+    # Ranking: most/least/top inventory by qty or value
+    if ranking_mode and not sku_value:
+        rows = query_sku_inventory_ranks(conn, mode=ranking_mode, limit=max(top_n, 5))
+        if not rows:
+            return compose_ask_response(
+                "No positive on-hand inventory was found in this demo session.",
+                [],
+                "Ask how many SKUs are available.",
+            ), snapshot, meta
+
+        lead = rows[0]
+        if ranking_mode == "least_qty":
+            headline = (
+                f"SKU {lead['sku']} has the least inventory with {lead['qty']:,} unit(s)."
+            )
+            follow = "Ask for low-stock SKUs below the alert threshold."
+        elif ranking_mode == "most_value":
+            headline = (
+                f"SKU {lead['sku']} has the highest inventory value at ${lead['value']:,.2f}."
+            )
+            follow = "Ask for the top 5 SKUs by inventory value."
+        else:
+            headline = (
+                f"SKU {lead['sku']} has the most inventory with {lead['qty']:,} unit(s)."
+            )
+            follow = "Ask for the top 5 SKUs by on-hand quantity."
+
+        show_n = top_n if top_n > 1 else min(4, len(rows))
+        bullets = [f"{lead['sku']}: {lead['description']}"]
+        if ranking_mode == "most_value":
+            bullets.extend(
+                f"#{idx}. SKU {row['sku']}: ${row['value']:,.2f} ({row['qty']:,} units)"
+                for idx, row in enumerate(rows[:show_n], start=1)
+            )
+        else:
+            bullets.extend(
+                f"#{idx}. SKU {row['sku']}: {row['qty']:,} units"
+                for idx, row in enumerate(rows[:show_n], start=1)
+            )
+        bullets.append(f"Active SKUs in catalog: {snapshot['sku_count']}")
+        return compose_ask_response(headline, bullets, follow), snapshot, meta
+
+    # Inventory / part availability (highest precision for LinkedIn demos)
+    if sku_value and (
+        intent in {"inventory", "planner", "unknown"}
+        or any(token in q for token in ("part", "sku", "stock", "on hand", "available", "left", "remain", "quantity"))
+    ):
+        available = get_available_inventory_qty(conn, sku_value, SOURCE_WAREHOUSE)
+        warehouse, location, best_qty = get_best_inventory_location(conn, sku_value, SOURCE_WAREHOUSE)
+        description = sku_semiconductor_description(sku_value)
+        c.execute(
+            """
+            SELECT warehouse, COALESCE(SUM(quantity), 0)
+            FROM inventory
+            WHERE sku = ? AND quantity > 0
+            GROUP BY warehouse
+            ORDER BY SUM(quantity) DESC
+            """,
+            (sku_value,),
+        )
+        by_wh = c.fetchall()
+        bullets = [
+            f"Source warehouse ({SOURCE_WAREHOUSE}): {available} unit(s)",
+            f"Best pick location: {location} at {warehouse} ({best_qty} on hand)",
+        ]
+        if by_wh:
+            bullets.append(
+                "Network on-hand: "
+                + ", ".join(f"{clean_display_text(wh, 'Warehouse')}: {int(qty)}" for wh, qty in by_wh[:4])
+            )
+        follow = f"Ask whether SKU {sku_value} can support a specific order quantity."
+        if requested_qty is not None:
+            if requested_qty <= available:
+                headline = (
+                    f"SKU {sku_value} ({description}) can support {requested_qty} unit(s). "
+                    f"Available at source: {available} unit(s)."
+                )
+            else:
+                headline = (
+                    f"SKU {sku_value} ({description}) cannot support {requested_qty} unit(s). "
+                    f"Only {available} unit(s) are available at {SOURCE_WAREHOUSE}."
+                )
+            follow = "Open Order Planning to place an order within available quantity."
+        else:
+            headline = (
+                f"SKU {sku_value} ({description}) has {available} part(s)/unit(s) left at {SOURCE_WAREHOUSE}."
+            )
+        return compose_ask_response(headline, bullets, follow), snapshot, meta
+
+    # Shipped / completed by date
+    if any(token in q for token in ("shipped", "completed", "closed")) and (
+        "order" in q or "how many" in q or day_value is not None or "today" in q or "yesterday" in q
+    ):
+        if day_value is None:
+            day_value = now_pt().date()
+            day_label = "today"
+            meta["assumption"] = "Interpreted missing date as today."
+        start_iso, end_iso = _ask_date_bounds(day_value)
+        c.execute(
+            """
+            SELECT COUNT(*)
+            FROM order_header
+            WHERE status = 'Completed'
+              AND date >= ?
+              AND date < ?
+            """,
+            (start_iso, end_iso),
+        )
+        shipped_count = int(c.fetchone()[0] or 0)
+        c.execute(
+            """
+            SELECT order_number
+            FROM order_header
+            WHERE status = 'Completed'
+              AND date >= ?
+              AND date < ?
+            ORDER BY date DESC
+            LIMIT 8
+            """,
+            (start_iso, end_iso),
+        )
+        sample = [row[0] for row in c.fetchall()]
+        bullets = [f"Filter used: status=Completed, date={day_label}"]
+        if sample:
+            bullets.append("Sample orders: " + ", ".join(sample))
+        if meta.get("assumption"):
+            bullets.append(meta["assumption"])
+        return compose_ask_response(
+            f"{shipped_count} order(s) shipped/completed on {day_label}.",
+            bullets,
+            "Ask for orders received on the same date for inflow vs outflow.",
+        ), snapshot, meta
+
+    # Orders received by date
+    if any(token in q for token in ("received", "placed", "created")) and ("order" in q or "how many" in q):
+        if day_value is None:
+            day_value = now_pt().date()
+            day_label = "today"
+            meta["assumption"] = "Interpreted missing date as today."
+        start_iso, end_iso = _ask_date_bounds(day_value)
+        c.execute(
+            """
+            SELECT COUNT(*)
+            FROM order_header
+            WHERE date >= ? AND date < ?
+            """,
+            (start_iso, end_iso),
+        )
+        received_count = int(c.fetchone()[0] or 0)
+        bullets = [f"Filter used: all orders with created date={day_label}"]
+        if meta.get("assumption"):
+            bullets.append(meta["assumption"])
+        return compose_ask_response(
+            f"{received_count} order(s) were received/created on {day_label}.",
+            bullets,
+            "Ask how many of those are still pending or already shipped.",
+        ), snapshot, meta
+
+    # Summary / executive overview
+    if intent in {"summary", "executive"} or any(token in q for token in ("summary", "summarize", "overview", "dashboard")):
+        open_orders = max(snapshot["orders_total"] - snapshot["completed"], 0)
+        pick_accuracy = (
+            round((snapshot["audits_passed"] / snapshot["audits_total"]) * 100, 1)
+            if snapshot["audits_total"]
+            else 100.0
+        )
+        return compose_ask_response(
+            (
+                f"Executive snapshot: {open_orders} open order(s), {snapshot['completed']} completed, "
+                f"{snapshot['blocked']} blocked, and inventory valued at ${snapshot['inventory_value']:,.2f}."
+            ),
+            [
+                f"Pipeline: {snapshot['orders_placed']} placed, {snapshot['picking']} picking, {snapshot['pending_verification']} pending verification.",
+                f"SLA risk on open work: {snapshot['sla_healthy']} healthy, {snapshot['sla_at_risk']} at risk, {snapshot['sla_breached']} breached.",
+                f"Quality: {snapshot['open_quality_issues']} open quality case(s); quality audit pass rate {pick_accuracy}% ({snapshot['audits_passed']}/{snapshot['audits_total']}).",
+                f"Inventory: {snapshot['sku_count']} active SKUs / {snapshot['units_on_hand']:,} units on hand.",
+            ],
+            "Ask which orders are blocked or which SKUs are low stock.",
+        ), snapshot, meta
+
+    # Blocked / shortage operations
+    if any(token in q for token in ("blocked", "shortage", "short")):
+        c.execute(
+            """
+            SELECT order_number, responsibility, date
+            FROM order_header
+            WHERE status = 'Blocked'
+            ORDER BY date DESC
+            LIMIT 12
+            """
+        )
+        rows = c.fetchall()
+        if not rows:
+            return compose_ask_response(
+                "0 orders are currently blocked by shortage in this demo session.",
+                [f"Open shortage escalations in Supervisor: {snapshot['open_shortage_issues']}"],
+                "Ask for low-stock SKUs that may create the next shortage.",
+            ), snapshot, meta
+        return compose_ask_response(
+            f"{len(rows)} order(s) are blocked by shortage.",
+            [f"{order_number} (owner: {responsibility})" for order_number, responsibility, _ in rows[:8]],
+            "Open Inventory to restock blocked SKUs, then confirm release in Supervisor.",
+        ), snapshot, meta
+
+    # Pending verification / quality queue
+    if any(token in q for token in ("pending verification", "verification", "to verify", "quality queue")):
+        c.execute(
+            """
+            SELECT order_number, date
+            FROM order_header
+            WHERE status = 'Pending Verification'
+            ORDER BY date DESC
+            LIMIT 12
+            """
+        )
+        rows = c.fetchall()
+        if not rows:
+            return compose_ask_response(
+                "0 orders are pending quality verification right now.",
+                [f"Open quality cases in Supervisor: {snapshot['open_quality_issues']}"],
+                "Ask for quality audit pass rate or failed audits.",
+            ), snapshot, meta
+        return compose_ask_response(
+            f"{len(rows)} order(s) are pending verification.",
+            [row[0] for row in rows[:8]],
+            "Open Quality to verify the oldest pending order first.",
+        ), snapshot, meta
+
+    # Quality issues / audits
+    if intent == "quality" or any(token in q for token in ("quality issue", "failed audit", "defect", "damage", "pass rate", "audit")):
+        if "pass" in q or "accuracy" in q or "audit" in q:
+            accuracy = (
+                round((snapshot["audits_passed"] / snapshot["audits_total"]) * 100, 1)
+                if snapshot["audits_total"]
+                else 100.0
+            )
+            return compose_ask_response(
+                f"Quality audit pass rate is {accuracy}% (passed audits ÷ total audits) based on {snapshot['audits_total']} audit(s).",
+                [
+                    f"Passed: {snapshot['audits_passed']}",
+                    f"Failed: {snapshot['audits_failed']}",
+                    f"Open quality cases: {snapshot['open_quality_issues']}",
+                ],
+                "Ask for the open quality issue list.",
+            ), snapshot, meta
+
+        c.execute(
+            """
+            SELECT issue_id, order_number, issue_type, issue_status
+            FROM supervisor_quality_issues
+            WHERE issue_status NOT IN ('Closed', 'Resolved')
+              AND COALESCE(issue_type, '') != ?
+            ORDER BY issue_date DESC
+            LIMIT 10
+            """,
+            (SHORTAGE_ISSUE_TYPE,),
+        )
+        rows = c.fetchall()
+        if not rows:
+            return compose_ask_response(
+                "0 open quality issues in Supervisor right now.",
+                [f"Failed audits on record: {snapshot['audits_failed']}"],
+                "Ask for pending verification volume.",
+            ), snapshot, meta
+        return compose_ask_response(
+            f"{len(rows)} open quality issue(s) require supervisor attention.",
+            [f"{issue_id} on {order_number} ({issue_type} / {status})" for issue_id, order_number, issue_type, status in rows],
+            "Open Supervisor to assign root cause and corrective action.",
+        ), snapshot, meta
+
+    # Supervisor escalations
+    if intent == "supervisor" or any(token in q for token in ("escalation", "supervisor")):
+        c.execute(
+            """
+            SELECT issue_id, order_number, issue_type, issue_status, assigned_to
+            FROM supervisor_quality_issues
+            WHERE issue_status NOT IN ('Closed', 'Resolved')
+            ORDER BY issue_date DESC
+            LIMIT 12
+            """
+        )
+        rows = c.fetchall()
+        if not rows:
+            return compose_ask_response(
+                "0 open supervisor escalations in this demo session.",
+                [
+                    f"Blocked orders: {snapshot['blocked']}",
+                    f"Pending verification: {snapshot['pending_verification']}",
+                ],
+                "Ask for SLA breached orders.",
+            ), snapshot, meta
+        return compose_ask_response(
+            f"{len(rows)} open supervisor escalation(s).",
+            [
+                f"{issue_id} / {order_number}: {issue_type} ({status})"
+                + (f", owner {assigned}" if clean_display_text(assigned, "") else "")
+                for issue_id, order_number, issue_type, status, assigned in rows
+            ],
+            "Filter Supervisor by Blocked vs Quality Issue for focused action.",
+        ), snapshot, meta
+
+    # Picker workload
+    if any(token in q for token in ("picker", "behind", "workload", "productivity", "picking in progress")):
+        c.execute(
+            """
+            SELECT COALESCE(user_role, 'Unassigned') AS picker_name,
+                   COUNT(*) AS pick_events
+            FROM inventory_transactions
+            WHERE tx_code = 'PICK'
+            GROUP BY picker_name
+            ORDER BY pick_events ASC
+            LIMIT 8
+            """
+        )
+        rows = c.fetchall()
+        c.execute(
+            """
+            SELECT COUNT(*) FROM order_header
+            WHERE status IN ('Orders Placed', 'Picking in Progress')
+            """
+        )
+        open_picks = int(c.fetchone()[0] or 0)
+        if not rows:
+            return compose_ask_response(
+                f"No pick transactions yet. {open_picks} order(s) are waiting in Operations.",
+                [f"Orders placed: {snapshot['orders_placed']}", f"Picking in progress: {snapshot['picking']}"],
+                "Assign a picker on the Operations workboard.",
+            ), snapshot, meta
+        return compose_ask_response(
+            "Picker activity ranked from lowest to highest pick volume:",
+            [f"{clean_display_text(name, 'Unknown')}: {count} pick event(s)" for name, count in rows],
+            "Compare this with live assignments on Operations.",
+        ), snapshot, meta
+
+    # Low stock / overstock
+    if "low stock" in q or "overstock" in q or ("stock" in q and "low" in q):
+        threshold = DEFAULT_LOW_STOCK_ALERT_THRESHOLD
+        if "overstock" in q:
+            c.execute(
+                """
+                SELECT sku, SUM(quantity) AS tq
+                FROM inventory
+                GROUP BY sku
+                HAVING tq > 5000
+                ORDER BY tq DESC
+                LIMIT 8
+                """
+            )
+            rows = c.fetchall()
+            if not rows:
+                return compose_ask_response(
+                    "0 overstock SKUs found (threshold > 5000 units).",
+                    [],
+                    "Ask for low-stock SKUs instead.",
+                ), snapshot, meta
+            return compose_ask_response(
+                f"{len(rows)} overstock SKU(s) above 5000 units.",
+                [f"SKU {sku}: {int(qty)} units" for sku, qty in rows],
+                "Review Inventory value concentration on the Executive dashboard.",
+            ), snapshot, meta
+
+        c.execute(
+            """
+            SELECT sku, SUM(quantity) AS tq
+            FROM inventory
+            GROUP BY sku
+            HAVING tq > 0 AND tq < ?
+            ORDER BY tq ASC
+            LIMIT 8
+            """,
+            (threshold,),
+        )
+        rows = c.fetchall()
+        if not rows:
+            return compose_ask_response(
+                f"0 low-stock SKUs below {threshold} units.",
+                [],
+                "Ask inventory value by warehouse.",
+            ), snapshot, meta
+        return compose_ask_response(
+            f"{len(rows)} low-stock SKU(s) below {threshold} units.",
+            [f"SKU {sku}: {int(qty)} units" for sku, qty in rows],
+            "Restock from Inventory before these become blocked-order shortages.",
+        ), snapshot, meta
+
+    # Inventory value by warehouse
+    if "inventory value" in q or ("value" in q and "warehouse" in q) or ("value by warehouse" in q):
+        c.execute(
+            """
+            SELECT warehouse, COALESCE(SUM(CAST(quantity AS REAL) * price), 0) AS val
+            FROM inventory
+            WHERE quantity > 0
+            GROUP BY warehouse
+            ORDER BY val DESC
+            """
+        )
+        rows = c.fetchall()
+        if not rows:
+            return compose_ask_response(
+                "No inventory valuation data is available in this demo session.",
+                [],
+                "Ask for active SKU count.",
+            ), snapshot, meta
+        return compose_ask_response(
+            f"Total inventory value is ${snapshot['inventory_value']:,.2f} across {len(rows)} warehouse(s).",
+            [f"{clean_display_text(wh, 'Warehouse')}: ${float(val):,.2f}" for wh, val in rows],
+            "Ask which SKUs contribute the most inventory value.",
+        ), snapshot, meta
+
+    # Planner / urgency / destinations
+    if intent == "planner" or any(token in q for token in ("destination", "urgency", "planner", "procurement")):
+        c.execute(
+            """
+            SELECT destination, COUNT(*)
+            FROM order_header
+            GROUP BY destination
+            ORDER BY COUNT(*) DESC
+            """
+        )
+        dest_rows = c.fetchall()
+        c.execute(
+            """
+            SELECT urgency, COUNT(*)
+            FROM order_header
+            GROUP BY urgency
+            ORDER BY COUNT(*) DESC
+            """
+        )
+        urgency_rows = c.fetchall()
+        return compose_ask_response(
+            f"Order Planning queue holds {snapshot['orders_total']} order(s) in this demo session "
+            f"({snapshot['orders_placed']} currently in Orders Placed).",
+            [
+                "Destinations: "
+                + (", ".join(f"{clean_display_text(dest, 'Unknown')}: {count}" for dest, count in dest_rows[:4]) or "none"),
+                "Urgency mix: "
+                + (
+                    ", ".join(
+                        f"{normalize_urgency(urgency, 'Standard')}: {count}"
+                        for urgency, count in urgency_rows[:4]
+                    )
+                    or "none"
+                ),
+            ],
+            "Ask whether a specific SKU can support a requested quantity.",
+        ), snapshot, meta
+
+    # SLA questions
+    if "sla" in q:
+        open_orders = snapshot["sla_healthy"] + snapshot["sla_at_risk"] + snapshot["sla_breached"]
+        return compose_ask_response(
+            f"SLA on {open_orders} open order(s): {snapshot['sla_healthy']} healthy, "
+            f"{snapshot['sla_at_risk']} at risk, {snapshot['sla_breached']} breached.",
+            [
+                f"Blocked orders: {snapshot['blocked']}",
+                f"Pending verification: {snapshot['pending_verification']}",
+            ],
+            "Ask for blocked orders if breach risk is tied to shortages.",
+        ), snapshot, meta
+
+    # Pending / open orders
+    if "pending" in q and "verification" not in q:
+        open_orders = max(snapshot["orders_total"] - snapshot["completed"], 0)
+        return compose_ask_response(
+            f"{open_orders} order(s) are pending (not completed).",
+            [
+                f"Orders Placed: {snapshot['orders_placed']}",
+                f"Picking in Progress: {snapshot['picking']}",
+                f"Pending Verification: {snapshot['pending_verification']}",
+                f"Blocked: {snapshot['blocked']}",
+                f"Quality Issue: {snapshot['quality_issue']}",
+            ],
+            "Ask for the blocked-order list or pending verification list.",
+        ), snapshot, meta
+
+    # Last-chance intelligent fallbacks before help menu
+    if any(token in q for token in ("inventory", "stock", "part", "sku", "on hand")):
+        rows = query_sku_inventory_ranks(conn, mode="most_qty", limit=5)
+        if rows:
+            lead = rows[0]
+            return compose_ask_response(
+                (
+                    f"Interpreted as an inventory ranking question: "
+                    f"SKU {lead['sku']} currently leads with {lead['qty']:,} unit(s)."
+                ),
+                [
+                    f"{lead['sku']}: {lead['description']}",
+                    *[f"SKU {row['sku']}: {row['qty']:,} units" for row in rows[1:4]],
+                    "Assumption: ranked by total on-hand quantity across warehouses.",
+                ],
+                "Ask which SKU has the highest inventory value.",
+            ), snapshot, {"intent": "inventory", "ranking": "most_qty", "assumption": True}
+
+    if any(token in q for token in ("order", "warehouse", "operation", "quality", "supervisor", "dashboard")):
+        open_orders = max(snapshot["orders_total"] - snapshot["completed"], 0)
+        return compose_ask_response(
+            (
+                f"Executive snapshot: {open_orders} open order(s), {snapshot['completed']} completed, "
+                f"{snapshot['blocked']} blocked, {snapshot['sku_count']} active SKUs."
+            ),
+            [
+                f"Pending verification: {snapshot['pending_verification']}",
+                f"Open quality cases: {snapshot['open_quality_issues']}",
+                f"Inventory value: ${snapshot['inventory_value']:,.2f}",
+            ],
+            "Ask a more specific question, e.g. which part number has the most inventory?",
+        ), snapshot, {"intent": "summary", "assumption": True}
+
+    # Fallback menu — only for truly vague asks
+    return compose_ask_response(
+        "I can answer exact warehouse questions from this demo session. Please include a subject like SKU, orders, quality, or inventory.",
+        [
+            "Inventory: which part has the most inventory, parts left for a SKU, low stock",
+            "Executive: shipped/received by date, SLA risk, inventory value",
+            "Operations: blocked orders, picker workload",
+            "Quality/Supervisor: pending verification, open escalations",
+        ],
+        "Try: Which part number has the most inventory?",
+    ), snapshot, meta
+
+
+@app.route("/ask-wms/new", methods=["POST", "GET"])
+def ask_wms_new_chat():
+    conn = get_conn()
+    conversation_id = create_ask_wms_conversation(conn, "New conversation")
+    conn.commit()
+    conn.close()
+    return redirect(f"/ask-wms?c={conversation_id}")
+
+
+@app.route("/ask-wms/clear-chat", methods=["POST"])
+def ask_wms_clear_chat():
+    conversation_id = request.form.get("conversation_id") or request.args.get("c")
+    conn = get_conn()
+    try:
+        conversation_id = int(conversation_id) if conversation_id else None
+    except (TypeError, ValueError):
+        conversation_id = None
+    clear_ask_wms_chat(conn, conversation_id)
+    conn.commit()
+    conn.close()
+    if conversation_id:
+        return redirect("/ask-wms")
+    return redirect("/ask-wms?chat_cleared=1")
+
+
+@app.route("/ask-wms", methods=["GET", "POST"])
+def ask_wms():
+    question = ""
+    conn = get_conn()
+
+    try:
+        conversation_id = int(request.values.get("c") or request.form.get("conversation_id") or 0)
+    except (TypeError, ValueError):
+        conversation_id = 0
+
+    conversations = list_ask_wms_conversations(conn)
+    active = get_ask_wms_conversation(conn, conversation_id) if conversation_id else None
+    if not active and conversations:
+        active = conversations[0]
+        conversation_id = active["id"]
+    if not active:
+        conversation_id = create_ask_wms_conversation(conn, "New conversation")
+        conn.commit()
+        active = get_ask_wms_conversation(conn, conversation_id)
+        conversations = list_ask_wms_conversations(conn)
+
+    if request.method == "POST":
+        question = clean_display_text(request.form.get("question"), "")
+    elif request.args.get("q"):
+        question = clean_display_text(request.args.get("q"), "")
+
+    if question:
+        prior_context = session.get("ask_wms_context") or {}
+        debug_mode = request.args.get("ask_debug") == "1" or request.form.get("ask_debug") == "1"
+        answer_html, snapshot, context = answer_ask_wms(
+            conn,
+            question,
+            prior_context=prior_context,
+            debug=debug_mode,
+        )
+        session["ask_wms_context"] = {
+            "intent": context.get("intent"),
+            "intent_family": context.get("intent_family"),
+            "entities": context.get("entities") or {},
+            "sku": context.get("sku"),
+            "order_id": context.get("order_id"),
+            "urgency": context.get("urgency"),
+            "picker": context.get("picker"),
+        }
+        meta = {
+            "intent": context.get("intent"),
+            "intent_family": context.get("intent_family"),
+            "entities": context.get("entities") or {},
+        }
+        # Rename untitled chats from the first user question.
+        if clean_display_text(active.get("title"), "") in {"", "New conversation", "Earlier conversation"}:
+            touch_ask_wms_conversation(conn, conversation_id, title=question)
+        save_ask_wms_message(conn, conversation_id, "user", question, {"source": "ask-wms"})
+        save_ask_wms_message(conn, conversation_id, "assistant", answer_html, meta)
+        conn.commit()
+        conn.close()
+        # PRG + fragment keeps the viewport on the latest message after submit.
+        return redirect(f"/ask-wms?c={conversation_id}#ask-bottom")
+
+    snapshot = build_ops_snapshot(conn)
+    chat_rows = list_ask_wms_chat(conn, conversation_id)
+    conn.close()
+
+    if not chat_rows:
+        welcome = compose_ask_response(
+            "Ask a warehouse question and I’ll answer from this demo session’s live data.",
+            follow_up="Example: How many SKUs are available?",
+        )
+        chat_rows = [
+            {
+                "id": 0,
+                "created_at": now_pt().isoformat(),
+                "role": "assistant",
+                "message": welcome,
+                "meta": {"intent": "welcome"},
+            }
+        ]
+
+    suggestions = [
+        "How is the warehouse performing today?",
+        "What needs supervisor attention right now?",
+        "How many orders shipped today?",
+        "Which orders are at risk of missing SLA?",
+        "Which part number has the most inventory?",
+        "What is our current quality pass rate?",
+        "What are the top three recommended actions?",
+        "Explain the order workflow",
+    ]
+    category_chips = [
+        ("Overview", "How is the warehouse performing today?"),
+        ("Orders", "How many orders are open?"),
+        ("SLA", "Which orders breached SLA?"),
+        ("Inventory", "Which SKUs are running low?"),
+        ("Operations", "Where is the largest operational backlog?"),
+        ("Quality", "Any open quality issues?"),
+        ("Shipping", "Anything ship today?"),
+        ("Supervisor", "What are the top three recommended actions?"),
+    ]
+    suggestion_html = "".join(
+        f"<form method='post' style='display:inline;margin:0;'>"
+        f"<input type='hidden' name='conversation_id' value='{conversation_id}'>"
+        f"<input type='hidden' name='question' value=\"{html_escape(item, quote=True)}\">"
+        f"<button type='submit'>{html_escape(item)}</button></form>"
+        for item in suggestions
+    )
+    chip_html = "".join(
+        f"<form method='post' style='display:inline;margin:0;'>"
+        f"<input type='hidden' name='conversation_id' value='{conversation_id}'>"
+        f"<input type='hidden' name='question' value=\"{html_escape(prompt, quote=True)}\">"
+        f"<button type='submit' class='ask-chip'>{html_escape(label)}</button></form>"
+        for label, prompt in category_chips
+    )
+
+    chat_html_parts = []
+    for row in chat_rows:
+        role = "user" if row["role"] == "user" else "assistant"
+        role_label = "You" if role == "user" else "Ask WMS"
+        stamp = format_pt_timestamp(row.get("created_at"), "-")
+        if role == "user":
+            body = f"<p class='ask-headline'>{html_escape(row.get('message', ''))}</p>"
+        else:
+            body = row.get("message", "")
+        chat_html_parts.append(
+            f"""
+            <div class='ask-bubble {role}'>
+                <div class='ask-bubble-role'>{role_label}</div>
+                {body}
+                <div class='ask-bubble-time'>{html_escape(stamp)}</div>
+            </div>
+            """
+        )
+    chat_transcript = "".join(chat_html_parts)
+
+    conversation_items = []
+    for item in conversations:
+        is_active = " active" if item["id"] == conversation_id else ""
+        title = html_escape(item["title"])
+        stamp = html_escape(format_pt_timestamp(item.get("updated_at"), "-"))
+        conversation_items.append(
+            f"<a class='ask-conversation-item{is_active}' href='/ask-wms?c={item['id']}'>"
+            f"{title}<span class='ask-conversation-meta'>{stamp}</span></a>"
+        )
+    if not conversation_items:
+        conversation_items.append("<div class='section-note'>No saved conversations yet.</div>")
+
+    content = f"""
+    <div class='ask-page-header'>
+        <div class='page-eyebrow'>&#9672; Ask WMS</div>
+        <h1>Executive Command Assistant</h1>
+        <p class='section-note' style='margin:0;'>Exact answers from this private demo session. Conversations stay on the left.</p>
+    </div>
+
+    <div class='ask-layout'>
+        <aside class='ask-sidebar'>
+            <h2 class='ask-sidebar-title'>Conversations</h2>
+            <form method='post' action='/ask-wms/new'>
+                <button class='ask-new-chat' type='submit'>New chat</button>
+            </form>
+            <div class='ask-conversation-list'>
+                {''.join(conversation_items)}
+            </div>
+        </aside>
+
+        <section class='ask-chat-shell'>
+            <div style='display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;'>
+                <div>
+                    <h2 style='margin:0;font-size:18px;'>{html_escape(active.get('title', 'Conversation'))}</h2>
+                </div>
+                <form method='post' action='/ask-wms/clear-chat' onsubmit="return confirm('Delete this conversation?');">
+                    <input type='hidden' name='conversation_id' value='{conversation_id}'>
+                    <button type='submit' class='action-btn secondary' style='width:auto;'>Delete chat</button>
+                </form>
+            </div>
+            <div class='ask-chat-log' id='ask-chat-log'>
+                {chat_transcript if chat_transcript else "<div class='ask-empty'>Start by asking a warehouse question.</div>"}
+                <div id='ask-bottom' tabindex='-1'></div>
+            </div>
+            <form method='post' class='ask-composer' id='ask-composer'>
+                <input type='hidden' name='conversation_id' value='{conversation_id}'>
+                <label for='ask-question' style='font-weight:700;color:#344054;'>Ask the warehouse</label>
+                <textarea id='ask-question' name='question' placeholder='Example: How many SKUs are available?'></textarea>
+                <div class='ask-composer-actions'>
+                    <span class='section-note'>Misspellings are normalized automatically.</span>
+                    <button type='submit'>Ask WMS</button>
+                </div>
+            </form>
+            <div class='ask-suggest'>{chip_html}</div>
+            <div class='ask-suggest'>{suggestion_html}</div>
+        </section>
+    </div>
+    <script>
+    (function () {{
+        function scrollAskToLatest() {{
+            const bottom = document.getElementById('ask-bottom');
+            const log = document.getElementById('ask-chat-log');
+            const composer = document.getElementById('ask-composer');
+            if (log) {{
+                log.scrollTop = log.scrollHeight;
+                const bubbles = log.querySelectorAll('.ask-bubble');
+                if (bubbles.length) {{
+                    bubbles[bubbles.length - 1].scrollIntoView({{ behavior: 'auto', block: 'nearest' }});
+                }}
+            }}
+            if (bottom) {{
+                bottom.scrollIntoView({{ behavior: 'auto', block: 'end' }});
+            }} else if (composer) {{
+                composer.scrollIntoView({{ behavior: 'auto', block: 'nearest' }});
+            }}
+        }}
+        if (document.readyState === 'loading') {{
+            document.addEventListener('DOMContentLoaded', scrollAskToLatest);
+        }} else {{
+            scrollAskToLatest();
+        }}
+        window.addEventListener('load', scrollAskToLatest);
+        if (window.location.hash === '#ask-bottom') {{
+            window.setTimeout(scrollAskToLatest, 0);
+            window.setTimeout(scrollAskToLatest, 50);
+        }}
+    }})();
+    </script>
+    """
+    return layout(content)
+
+
 # ======================================================
 # PLANNER
 # Inventory Risks moved to dedicated section above.
@@ -4511,10 +6931,30 @@ def planner():
     )
     sku_rows = c.fetchall()
     skus = [row[0] for row in sku_rows]
+
+    source_text, source_text_like, source_city_like, source_code_like = build_warehouse_filters(SOURCE_WAREHOUSE)
+    c.execute(
+        """
+        SELECT sku, COALESCE(SUM(quantity), 0)
+        FROM inventory
+        WHERE TRIM(COALESCE(sku, '')) <> ''
+          AND (
+            warehouse = ?
+            OR warehouse LIKE ?
+            OR warehouse LIKE ?
+            OR warehouse LIKE ?
+          )
+        GROUP BY sku
+        """,
+        (source_text, source_text_like, source_city_like, source_code_like),
+    )
+    available_by_sku = {row[0]: int(row[1] or 0) for row in c.fetchall()}
+
     sku_catalog = {
         row[0]: {
             "description": sku_semiconductor_description(row[0]),
             "price": float(row[1] or 0),
+            "available": available_by_sku.get(row[0], 0),
         }
         for row in sku_rows
     }
@@ -4594,6 +7034,37 @@ def planner():
         order_number = "ORD-" + current_time.strftime("%Y%m%d%H%M%S")
         request_id = "REQ-" + current_time.strftime("%H%M%S")
         expected_quantity = sum(line_items.values())
+
+        inventory_shortfalls = []
+        for sku_value, qty_value in line_items.items():
+            available_qty = get_available_inventory_qty(conn, sku_value, source)
+            if qty_value > available_qty:
+                inventory_shortfalls.append(
+                    {
+                        "sku": sku_value,
+                        "requested": qty_value,
+                        "available": available_qty,
+                        "description": sku_semiconductor_description(sku_value),
+                    }
+                )
+
+        if inventory_shortfalls:
+            conn.close()
+            shortfall_rows = "".join(
+                f"<li><strong>{item['sku']}</strong> — {item['description']}: "
+                f"requested {item['requested']}, available {item['available']}</li>"
+                for item in inventory_shortfalls
+            )
+            return layout(f"""
+                <div class="card">
+                    <div class="flash-warning">
+                        <h2 style="margin-top:0;">Insufficient Inventory</h2>
+                        <p>Order Planning cannot place this order because one or more SKUs exceed available on-hand quantity at {source}.</p>
+                        <ul>{shortfall_rows}</ul>
+                    </div>
+                    <a href="/planner">Go Back to Order Planning</a>
+                </div>
+            """)
 
         c.execute("""
             INSERT INTO order_header (
@@ -4785,9 +7256,9 @@ def planner():
         <section class='card planner-dashboard-header'>
             <div class='planner-header-top'>
                 <div class='planner-header-copy'>
-                    <div class='page-eyebrow'>&#9672; Planner Dashboard</div>
+                    <div class='page-eyebrow'>&#9672; Order Planning Dashboard</div>
                     <h2>Create Order</h2>
-                    <p class='section-note'>Compact order entry with pricing visibility for planning only. The live queue remains fixed in view below.</p>
+                    <p class='section-note'>Compact order entry with pricing visibility for planning only. Orders cannot exceed available source-warehouse inventory. The live queue remains fixed in view below.</p>
                 </div>
                 <div class='planner-header-metrics'>
                     <div class='planner-metric'>
@@ -4844,7 +7315,7 @@ def planner():
                         <div class='planner-total-label'>Estimated Extended Total</div>
                         <div id='planner-order-total' class='planner-total-value'>$0.00</div>
                     </div>
-                    <div class='planner-total-note'>Pricing and totals remain exclusive to Planner and are hidden from Operations pick views.</div>
+                    <div class='planner-total-note'>Pricing and totals remain exclusive to Order Planning and are hidden from Operations pick views.</div>
                 </div>
 
                 <div class='planner-create-actions'>
@@ -4972,11 +7443,22 @@ def planner():
             }}
 
             const sku = skuSelect.value || '';
-            const catalogItem = skuCatalog[sku] || {{ description: 'Select a semiconductor part', price: 0 }};
+            const catalogItem = skuCatalog[sku] || {{ description: 'Select a semiconductor part', price: 0, available: 0 }};
             const quantity = Number(qtyInput.value || 0);
             const lineTotal = Number(catalogItem.price || 0) * quantity;
+            const availableQty = Number(catalogItem.available || 0);
 
-            descCell.textContent = catalogItem.description || 'Select a semiconductor part';
+            if (sku) {{
+                descCell.textContent = (catalogItem.description || 'Semiconductor part') + ' · Available ' + availableQty;
+                if (quantity > availableQty) {{
+                    descCell.style.color = '#b42318';
+                }} else {{
+                    descCell.style.color = '#475569';
+                }}
+            }} else {{
+                descCell.textContent = 'Select a semiconductor part';
+                descCell.style.color = '#475569';
+            }}
             priceCell.textContent = formatCurrency(Number(catalogItem.price || 0));
             totalCell.textContent = formatCurrency(lineTotal);
             updatePlannerTotal();
@@ -5131,18 +7613,81 @@ OPERATIONS_WORKBOARD_TEMPLATE = """
         <div class='ops-stream-stats'>
             <div class='ops-stream-stat in-progress'>
                 <span>Picking Now</span>
-                <strong>{{ in_progress_count }}</strong>
+                <strong>{{ filtered_in_progress_count }}</strong>
             </div>
             <div class='ops-stream-stat ready'>
                 <span>Ready Next</span>
-                <strong>{{ ready_count }}</strong>
+                <strong>{{ filtered_ready_count }}</strong>
             </div>
             <div class='ops-stream-stat completed'>
                 <span>Completed / Sent Forward</span>
-                <strong>{{ completed_lane_count }}</strong>
+                <strong>{{ filtered_completed_count }}</strong>
             </div>
         </div>
     </div>
+
+    <div class='filter-panel' style='margin:18px 0 8px;padding:0;box-shadow:none;border:none;background:transparent;'>
+        <div class='filter-panel-header' style='margin-bottom:12px;'>
+            <div>
+                <div class='section-note' style='text-transform:uppercase;letter-spacing:0.06em;font-weight:700;'>Search &amp; Filters</div>
+                <div class='section-note'>Showing {{ workboard_items|length }} of {{ workboard_total_count }} worklist order(s).</div>
+            </div>
+            <a class='quick-link' href='{{ clear_filters_url }}'>Clear Filters</a>
+        </div>
+        <form method='get'>
+            <input type='hidden' name='picker' value='{{ current_picker }}'>
+            <div class='filter-grid' style='grid-template-columns:repeat(auto-fit, minmax(180px, 1fr));'>
+                <div class='filter-field'>
+                    <label class='filter-label' for='ops-search'>Search</label>
+                    <input id='ops-search' type='text' name='q' value='{{ filter_q }}' placeholder='Order, SKU, or picker'>
+                </div>
+                <div class='filter-field'>
+                    <label class='filter-label' for='ops-status'>Status</label>
+                    <select id='ops-status' name='status'>
+                        <option value='' {% if not filter_status %}selected{% endif %}>All</option>
+                        <option value='ready' {% if filter_status == 'ready' %}selected{% endif %}>Ready</option>
+                        <option value='picking' {% if filter_status == 'picking' %}selected{% endif %}>Picking</option>
+                        <option value='Pending Verification' {% if filter_status == 'Pending Verification' %}selected{% endif %}>Pending Verification</option>
+                        <option value='Completed' {% if filter_status == 'Completed' %}selected{% endif %}>Completed</option>
+                        <option value='Quality Issue' {% if filter_status == 'Quality Issue' %}selected{% endif %}>Quality Issue</option>
+                        <option value='Blocked' {% if filter_status == 'Blocked' %}selected{% endif %}>Blocked</option>
+                    </select>
+                </div>
+                <div class='filter-field'>
+                    <label class='filter-label' for='ops-urgency'>Priority</label>
+                    <select id='ops-urgency' name='urgency'>
+                        <option value='' {% if not filter_urgency %}selected{% endif %}>All</option>
+                        <option value='Critical' {% if filter_urgency == 'Critical' %}selected{% endif %}>Critical</option>
+                        <option value='Urgent' {% if filter_urgency == 'Urgent' %}selected{% endif %}>Urgent</option>
+                        <option value='Standard' {% if filter_urgency == 'Standard' %}selected{% endif %}>Standard</option>
+                    </select>
+                </div>
+                <div class='filter-field'>
+                    <label class='filter-label' for='ops-assigned-picker'>Picker</label>
+                    <select id='ops-assigned-picker' name='assigned_picker'>
+                        <option value='' {% if not filter_assigned_picker %}selected{% endif %}>All</option>
+                        {% for name in picker_roster %}
+                        <option value='{{ name }}' {% if filter_assigned_picker == name %}selected{% endif %}>{{ name }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class='filter-field'>
+                    <label class='filter-label' for='ops-warehouse'>Warehouse</label>
+                    <select id='ops-warehouse' name='warehouse'>
+                        <option value='' {% if not filter_warehouse %}selected{% endif %}>All</option>
+                        {% for name in warehouse_options %}
+                        <option value='{{ name }}' {% if filter_warehouse == name %}selected{% endif %}>{{ name }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+            </div>
+            <div class='filter-foot'>
+                <div class='section-note'>Filters apply to the worklist only. Workboard KPIs stay unfiltered.</div>
+                <button type='submit'>Apply Filters</button>
+            </div>
+        </form>
+    </div>
+
     <div class='ops-stream-list'>
         {% if workboard_items %}
             {% for card in workboard_items %}
@@ -5277,8 +7822,13 @@ OPERATIONS_WORKBOARD_TEMPLATE = """
             {% endfor %}
         {% else %}
         <div class='ops-empty-state'>
+            {% if filters_active %}
+            <b>No orders match the current filters.</b>
+            <div style='margin-top:6px;'>Try clearing filters or adjusting search, status, priority, picker, or warehouse.</div>
+            {% else %}
             <b>No operational work is currently visible.</b>
             <div style='margin-top:6px;'>Released orders, active picks, and recent completions will appear here automatically.</div>
+            {% endif %}
         </div>
         {% endif %}
     </div>
@@ -5291,6 +7841,21 @@ def operations():
     current_picker = resolve_picker_identity(request.args.get("picker"))
     ops_message = request.args.get("ops_message", "").strip()
     ops_message_type = "warning" if request.args.get("ops_message_type", "success").strip() == "warning" else "success"
+
+    filter_q = request.args.get("q", "").strip()
+    filter_status = request.args.get("status", "").strip()
+    filter_urgency_raw = request.args.get("urgency", "").strip()
+    filter_urgency = normalize_urgency(filter_urgency_raw, "") if filter_urgency_raw else ""
+    filter_assigned_picker = request.args.get("assigned_picker", "").strip()
+    if filter_assigned_picker and filter_assigned_picker not in PICKER_ROSTER:
+        filter_assigned_picker = ""
+    filter_warehouse_raw = request.args.get("warehouse", "").strip()
+    filter_warehouse = canonicalize_warehouse_name(filter_warehouse_raw, "") if filter_warehouse_raw else ""
+    if filter_warehouse and filter_warehouse not in WAREHOUSE_NETWORK:
+        filter_warehouse = ""
+    filters_active = bool(
+        filter_q or filter_status or filter_urgency or filter_assigned_picker or filter_warehouse
+    )
 
     conn = get_conn()
     shortage_sync = sync_shortage_order_workflow(conn)
@@ -5451,6 +8016,11 @@ def operations():
             "progress_label": f"{progress_pct}%",
             "detail_rows": detail_rows,
             "hidden_item_count": hidden_item_count,
+            "sku_list": [sku for sku, _qty in readiness.get("expected_lines", [])],
+            "source_warehouse": source_wh,
+            "raw_status": status,
+            "assigned_picker": "",
+            "picker_display": "Needs Assignment",
             "summary": f"{urgency} priority order ready for the next available picker.",
         })
 
@@ -5497,7 +8067,7 @@ def operations():
                 "breached": "SLA Breached",
             }[sla_key],
             "picker_display": picker_display,
-            "assigned_picker": assigned_picker,
+            "assigned_picker": assigned_picker if not is_generic_picker_identity(assigned_picker) else "",
             "can_take_over": can_take_over,
             "started_display": started_display,
             "time_remaining_display": sla_timer,
@@ -5511,6 +8081,9 @@ def operations():
             "remaining_lines_label": f"{readiness_summary['remaining_lines']} SKU(s)",
             "detail_rows": detail_rows,
             "hidden_item_count": hidden_item_count,
+            "sku_list": [sku for sku, _qty in pick_readiness.get("expected_lines", [])],
+            "source_warehouse": source_wh,
+            "raw_status": status,
             "take_over_note": f"Take ownership from {picker_display} and keep working this order.",
             "pick_screen_note": "Open the live pick screen to verify location, enter the quantity you picked, and post the actual transaction yourself.",
             "auto_complete_note": (
@@ -5532,7 +8105,11 @@ def operations():
     for order_number, urgency, status, date_str, picker_name, source_wh, completed_at in completed_orders_raw:
         urgency = normalize_urgency(urgency, "Standard")
         completed_display = format_pt_timestamp(completed_at or date_str)
+        readiness = get_order_pick_readiness(conn, order_number)
         detail_rows, hidden_item_count = get_order_workboard_lines(conn, order_number, source_wh)
+        assigned_picker = clean_display_text(picker_name, "")
+        if is_generic_picker_identity(assigned_picker):
+            assigned_picker = ""
         if status == "Completed":
             status_label = "Completed"
         elif status == "Quality Issue":
@@ -5550,9 +8127,13 @@ def operations():
             "priority_label": urgency,
             "priority_class": f"priority-{urgency.lower().replace(' ', '-')}",
             "picker_display": format_picker_display_name(picker_name),
+            "assigned_picker": assigned_picker,
             "completed_display": completed_display,
             "detail_rows": detail_rows,
             "hidden_item_count": hidden_item_count,
+            "sku_list": [sku for sku, _qty in readiness.get("expected_lines", [])],
+            "source_warehouse": source_wh,
+            "raw_status": status,
             "status_label": status_label,
             "completed_scope_label": f"{sum(item['required_qty'] for item in detail_rows)} unit(s) shown",
             "summary": (
@@ -5567,13 +8148,28 @@ def operations():
         })
 
     completed_lane_count = len(completed_orders)
-    workboard_items = active_orders + ready_orders + completed_orders
+    workboard_items_all = active_orders + ready_orders + completed_orders
+    workboard_total_count = len(workboard_items_all)
+    workboard_items = apply_operations_worklist_filters(
+        workboard_items_all,
+        search=filter_q,
+        status=filter_status,
+        urgency=filter_urgency,
+        assigned_picker=filter_assigned_picker,
+        warehouse=filter_warehouse,
+    )
+    filtered_ready_count = sum(1 for card in workboard_items if card.get("stage_key") == "ready")
+    filtered_in_progress_count = sum(1 for card in workboard_items if card.get("stage_key") == "in_progress")
+    filtered_completed_count = sum(1 for card in workboard_items if card.get("stage_key") == "completed")
 
     conn.close()
+    clear_filters_url = f"/operations?{urlencode({'picker': current_picker})}"
     content = render_template_string(
         OPERATIONS_WORKBOARD_TEMPLATE,
         current_picker=current_picker,
         picker_roster=PICKER_ROSTER,
+        warehouse_options=WAREHOUSE_NETWORK,
+        clear_filters_url=clear_filters_url,
         ops_message=ops_message,
         ops_message_type=ops_message_type,
         shortage_alerts=[
@@ -5591,10 +8187,20 @@ def operations():
             for alert in active_shortage_alerts
         ],
         workboard_items=workboard_items,
+        workboard_total_count=workboard_total_count,
+        filters_active=filters_active,
+        filter_q=filter_q,
+        filter_status=filter_status,
+        filter_urgency=filter_urgency,
+        filter_assigned_picker=filter_assigned_picker,
+        filter_warehouse=filter_warehouse,
         ready_count=ready_count,
         in_progress_count=in_progress_count,
         completed_count=completed_count,
         completed_lane_count=completed_lane_count,
+        filtered_ready_count=filtered_ready_count,
+        filtered_in_progress_count=filtered_in_progress_count,
+        filtered_completed_count=filtered_completed_count,
         shortage_count=len(shortage_alerts),
     )
     return layout(content)
@@ -5828,7 +8434,10 @@ def operations_update_order_status(order):
 @app.route("/inventory")
 def inventory_overview():
     sku_filter = request.args.get("sku", "").strip()
-    warehouse_filter = request.args.get("warehouse", "").strip()
+    warehouse_filter_raw = request.args.get("warehouse", "").strip()
+    warehouse_filter = canonicalize_warehouse_name(warehouse_filter_raw, "") if warehouse_filter_raw else ""
+    if warehouse_filter and warehouse_filter not in WAREHOUSE_NETWORK:
+        warehouse_filter = ""
     location_filter = request.args.get("location", "").strip()
     tx_code_filter = request.args.get("tx_code", "").strip()
     tx_order_filter = request.args.get("tx_order", "").strip()
@@ -6013,16 +8622,22 @@ def inventory_overview():
     )
     low_stock_rows = c.fetchall()
 
-    c.execute(
-        """
-        SELECT DISTINCT warehouse
-        FROM inventory
-        WHERE TRIM(COALESCE(warehouse, '')) <> ''
-          AND LOWER(TRIM(COALESCE(warehouse, ''))) <> 'nan'
-        ORDER BY warehouse
-        """
+    warehouse_options = list(WAREHOUSE_NETWORK)
+    selected_warehouse = warehouse_filter if warehouse_filter in warehouse_options else ""
+    warehouse_filter_options = ['<option value="">Any warehouse</option>'] + [
+        f"<option value='{warehouse}'{' selected' if warehouse == selected_warehouse else ''}>{warehouse}</option>"
+        for warehouse in warehouse_options
+    ]
+    adjust_warehouse_value = canonicalize_warehouse_name(
+        adjust_warehouse or warehouse_filter or SOURCE_WAREHOUSE,
+        SOURCE_WAREHOUSE,
     )
-    warehouse_options = [row[0] for row in c.fetchall()]
+    if adjust_warehouse_value not in warehouse_options:
+        adjust_warehouse_value = SOURCE_WAREHOUSE
+    adjust_warehouse_options = "".join(
+        f"<option value='{warehouse}'{' selected' if warehouse == adjust_warehouse_value else ''}>{warehouse}</option>"
+        for warehouse in warehouse_options
+    )
     c.execute(
         """
         SELECT DISTINCT location
@@ -6479,8 +9094,10 @@ def inventory_overview():
                     <input name='sku' value='{sku_filter}' placeholder='Find by SKU code' style='padding:8px 12px;border:1px solid #e2e8f0;border-radius:6px;'>
                 </div>
                 <div class='filter-field'>
-                    <label class='filter-label'><b>Warehouse</b></label>
-                    <input name='warehouse' value='{warehouse_filter}' list='warehouse-options' placeholder='Any warehouse' style='padding:8px 12px;border:1px solid #e2e8f0;border-radius:6px;'>
+                    <label class='filter-label' for='inventory-warehouse'><b>Warehouse</b></label>
+                    <select id='inventory-warehouse' name='warehouse'>
+                        {''.join(warehouse_filter_options)}
+                    </select>
                 </div>
                 <div class='filter-field'>
                     <label class='filter-label'><b>Location</b></label>
@@ -6533,9 +9150,6 @@ def inventory_overview():
                 </div>
             </div>
         </form>
-        <datalist id='warehouse-options'>
-            {''.join(f"<option value='{warehouse}'></option>" for warehouse in warehouse_options)}
-        </datalist>
         <datalist id='location-options'>
             {''.join(f"<option value='{location}'></option>" for location in location_options)}
         </datalist>
@@ -6592,8 +9206,10 @@ def inventory_overview():
                         <input name='sku' value='{adjust_sku or sku_filter}' list='sku-options' placeholder='Select SKU' required>
                     </div>
                     <div class='filter-field'>
-                        <label class='filter-label'>Warehouse</label>
-                        <input name='warehouse' value='{adjust_warehouse or warehouse_filter}' list='warehouse-options' placeholder='Warehouse' required>
+                        <label class='filter-label' for='adjust-warehouse'>Warehouse</label>
+                        <select id='adjust-warehouse' name='warehouse' required>
+                            {adjust_warehouse_options}
+                        </select>
                     </div>
                     <div class='filter-field'>
                         <label class='filter-label'>Location</label>
@@ -6686,7 +9302,7 @@ def inventory_overview():
 @app.route("/inventory_adjust", methods=["POST"])
 def inventory_adjust():
     sku = request.form.get("sku", "").strip()
-    warehouse = request.form.get("warehouse", "").strip()
+    warehouse = canonicalize_warehouse_name(request.form.get("warehouse", "").strip(), "")
     location = request.form.get("location", "").strip()
     qty_change_raw = request.form.get("qty_change", "").strip()
     notes = request.form.get("notes", "").strip()
@@ -6698,9 +9314,9 @@ def inventory_adjust():
         "low_stock_threshold": parse_low_stock_threshold(request.form.get("low_stock_threshold")),
     }
 
-    if not sku or not warehouse or not location:
+    if not sku or not warehouse or warehouse not in WAREHOUSE_NETWORK or not location:
         redirect_params.update({
-            "inventory_message": "SKU, warehouse, and location are required before an adjustment can be posted.",
+            "inventory_message": "SKU, a valid network warehouse, and location are required before an adjustment can be posted.",
             "inventory_message_type": "error",
         })
         return redirect(f"/inventory?{urlencode(redirect_params)}#adjust-inventory")
@@ -7924,7 +10540,7 @@ def order_detail(order):
         """
     else:
         quick_links_html = """
-            <a class='quick-link' href='/planner'>Planner</a>
+            <a class='quick-link' href='/planner'>Order Planning</a>
             <a class='quick-link' href='/operations'>Operations</a>
             <a class='quick-link' href='/quality'>Quality</a>
             <a class='quick-link' href='/supervisor'>Supervisor</a>
@@ -8872,6 +11488,9 @@ def supervisor():
 # ======================================================
 # EXECUTIVE DASHBOARD
 # ======================================================
+@app.route("/healthz")
+def healthz():
+    return {"status": "ok"}, 200
 @app.route("/executive")
 def executive_dashboard():
     conn = get_conn()
@@ -8896,7 +11515,7 @@ def executive_dashboard():
     c.execute("SELECT COUNT(*) FROM order_header WHERE status != 'Completed'")
     orders_pending = c.fetchone()[0]
 
-    # ── KPI 4: Pick accuracy ──────────────────────────────────────────────────
+    # ── KPI 4: Quality audit pass rate (passed audits / total audits) ─────────
     c.execute("SELECT COUNT(*) FROM quality_audits")
     total_audits = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM quality_audits WHERE result IN ('Pass', 'Passed')")
@@ -8933,6 +11552,8 @@ def executive_dashboard():
         ("Completed",           "Shipped",       status_map.get("Completed", 0),            "#dcfce7", "#166534"),
     ]
     quality_exc_count = status_map.get("Quality Issue", 0)
+    blocked_count = status_map.get("Blocked", 0)
+    pending_verification_count = status_map.get("Pending Verification", 0)
 
     # ── Daily order volume — last 14 days ─────────────────────────────────────
     c.execute("""
@@ -9560,6 +12181,7 @@ def executive_dashboard():
         <p style='color:var(--ink-500);font-size:15px;margin:0;'>
             Live operational overview &mdash; {format_executive_timestamp(now)}
         </p>
+        {f"<div class='demo-session-note' style='margin-top:14px;background:#ecfdf5;border-color:#86efac;color:#166534;'>Your private demo workspace has been reset.</div>" if request.args.get('demo_reset') == '1' else ''}
         <div class='exec-section-switcher'>
             <button type='button' class='exec-switch-btn active' data-target='overview'>Overview</button>
             <button type='button' class='exec-switch-btn' data-target='productivity'>Productivity</button>
@@ -9599,9 +12221,9 @@ def executive_dashboard():
             </span>
         </div>
         <div class='exec-kpi-card kpi-violet'>
-            <div class='exec-kpi-eyebrow'>Pick Accuracy</div>
+            <div class='exec-kpi-eyebrow'>Quality Audit Pass Rate</div>
             <div class='exec-kpi-number'>{pick_accuracy}%</div>
-            <div class='exec-kpi-sub'>{passed_audits} of {total_audits} audits passed</div>
+            <div class='exec-kpi-sub'>{passed_audits} passed of {total_audits} audits</div>
             {pick_acc_badge}
         </div>
         <div class='exec-kpi-card kpi-teal'>
@@ -9698,7 +12320,7 @@ def executive_dashboard():
             <div style='padding:16px 0 4px 0;'>
         <div class='exec-kpi-grid'>
             <div class='exec-kpi-card' style='background:linear-gradient(135deg, #065f46, #10b981);border-left:4px solid #34d399;'>
-                <div class='exec-kpi-eyebrow' style='color:#a7f3d0;'>Pick Accuracy</div>
+                <div class='exec-kpi-eyebrow' style='color:#a7f3d0;'>Quality Audit Pass Rate</div>
                 <div class='exec-kpi-number' style='color:#6ee7b7;'>{pick_accuracy}%</div>
                 <div class='exec-kpi-sub' style='color:#a7f3d0;'>{passed_audits} passed of {total_audits} audits</div>
                 {pick_acc_badge}
@@ -9785,7 +12407,7 @@ def executive_dashboard():
                 <span class='exec-stat-value'>{on_time_rate}%</span>
             </div>
             <div style='margin-top:14px;'>
-                {_progress("Pick Accuracy", pick_accuracy, "#7c3aed")}
+                {_progress("Quality Audit Pass Rate", pick_accuracy, "#7c3aed")}
                 {_progress("Inventory Accuracy", inv_accuracy, CHART_TEAL)}
                 {_progress("On-Time Rate", on_time_rate, CHART_SUCCESS)}
             </div>
@@ -9976,7 +12598,7 @@ def executive_dashboard():
                 <span class='exec-stat-value'>{round((shipped_total / orders_all_time) * 100, 1) if orders_all_time else 0}%</span>
             </div>
             <div class='exec-stat-row'>
-                <span class='exec-stat-label'>Quality Pass Rate</span>
+                <span class='exec-stat-label'>Quality Audit Pass Rate</span>
                 <span class='exec-stat-value'>{pick_accuracy}%</span>
             </div>
             <div class='exec-stat-row'>
@@ -9998,7 +12620,7 @@ def executive_dashboard():
             <div style='margin-top:16px;'>
                 {_progress("Fulfillment Rate", shipped_total, CHART_SUCCESS, max(orders_all_time, 1))}
                 {_progress("SLA Compliance", on_time_rate, CHART_SUCCESS)}
-                {_progress("Pick Accuracy", pick_accuracy, CHART_VIOLET)}
+                {_progress("Quality Audit Pass Rate", pick_accuracy, CHART_VIOLET)}
             </div>
         </div>
     </div>
@@ -10009,7 +12631,7 @@ def executive_dashboard():
         <h3 style='margin-bottom:12px;'>Navigate to Operational Modules</h3>
         <div class='quick-links'>
             <a class='quick-link' href='/executive?view=overview'>&#9672; Executive Overview</a>
-            <a class='quick-link' href='/planner'>&#9672; Order Planner</a>
+            <a class='quick-link' href='/planner'>&#9672; Order Planning</a>
             <a class='quick-link' href='/inventory'>&#9632; Inventory</a>
             <a class='quick-link' href='/operations'>&#9654; Operations</a>
             <a class='quick-link' href='/quality'>&#9888; Quality</a>
@@ -10069,54 +12691,21 @@ def executive_dashboard():
 # STARTUP
 # ======================================================
 if __name__ == "__main__":
-    init_db()
-    try:
-        load_inventory()
-    except Exception as exc:
-        print(f"Warning: could not load inventory spreadsheet: {exc}")
-    bootstrap_result = ensure_bootstrap_demo_data()
-    if bootstrap_result["seeded_inventory_rows"]:
-        print(
-            f"Seeded {bootstrap_result['seeded_inventory_rows']} demo inventory row(s) because no spreadsheet inventory was available."
-        )
-    if bootstrap_result["seeded_orders"]:
-        print(
-            f"Seeded {bootstrap_result['seeded_orders']} demo order(s) with "
-            f"{bootstrap_result['seeded_quality_escalations']} quality escalation(s)."
-        )
+    migrated = migrate_legacy_db_to_master()
+    if migrated:
+        print("Promoted existing enterprise_wms.db into enterprise_wms_master.db seed template.")
 
-    conn = get_conn()
-    reset_summary = reset_demo_data(conn)
-    conn.commit()
-    if reset_summary["orders_removed"]:
-        print(
-            "Startup reset cleared active warehouse workload: "
-            f"{reset_summary['status_summary']}"
-        )
-    normalized_rows = normalize_inventory_assignments(conn)
-    normalized_urgency_rows = normalize_urgency_labels(conn)
-    if normalized_rows:
-        conn.commit()
-        print(
-            f"Normalized {normalized_rows} inventory row(s) with default assignment "
-            f"{DEFAULT_INVENTORY_WAREHOUSE}/{DEFAULT_INVENTORY_LOCATION}."
-        )
-    if normalized_urgency_rows:
-        conn.commit()
-        print(f"Normalized {normalized_urgency_rows} order urgency value(s) to Standard/Urgent/Critical.")
-
-    startup_blocked_orders = enforce_quality_gate_on_pending_orders(conn)
-    if startup_blocked_orders:
-        conn.commit()
-        print(
-            "Quality gate remediation moved "
-            f"{len(startup_blocked_orders)} order(s) from Pending Verification to Picking in Progress."
-        )
-    conn.close()
+    # Ensure the shared 82-order / 0-pending baseline. Re-seed only when master is
+    # stale/missing; purge visitor clones when rebuilt so browsers pick up KPIs immediately.
+    bootstrap_application(force_orders=not db_has_demo_baseline(MASTER_DB))
 
     host, port, debug = get_runtime_config(default_port=5000)
     selected_port = prepare_runtime_port(host, port, __file__)
     if selected_port != port:
-        print(f"Port {port} is busy. Starting Enterprise WMS on port {selected_port} instead.")
+        print(f"Port {port} is busy. Starting DigiTech WMS on port {selected_port} instead.")
 
+    print(
+        "Visitor demos use isolated SQLite files under demo_sessions/ cloned from the "
+        "82-order completed master seed. Reset Demo restores that same baseline."
+    )
     app.run(host=host, port=selected_port, debug=debug, use_reloader=False)

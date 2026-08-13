@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: digitech-wms
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn whs_mgmt:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: WMS_SECRET_KEY
+        generateValue: true
+      - key: FLASK_DEBUG
+        value: "0"
+      - key: WMS_DEMO_SESSION_TTL_HOURS
+        value: "24"
+    # Free tier uses ephemeral disk. On each cold start the app rebuilds
+    # enterprise_wms_master.db with the 82-order completed baseline if missing.
+    # Visitor clones live under demo_sessions/ and are not persisted across deploys.
